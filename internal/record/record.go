@@ -23,6 +23,14 @@ const (
 	MaxValueSize = 1 << 30 // 1 GiB
 )
 
+// maxKeySize / maxValueSize are the limits actually enforced by Encode/Decode.
+// They default to the exported consts, but are package-level vars so tests can
+// lower them to exercise the guards without allocating gigabyte-sized inputs.
+var (
+	maxKeySize   = MaxKeySize
+	maxValueSize = MaxValueSize
+)
+
 // ErrCorrupted is returned when a record's CRC does not match its contents, or
 // when its on-disk lengths exceed the size limits (a sign of corruption).
 var ErrCorrupted = errors.New("record: checksum mismatch")
@@ -77,10 +85,10 @@ func Encode(w io.Writer, key, value []byte) error {
 func EncodeAt(w io.Writer, ts uint64, key, value []byte) error {
 	tombstone := value == nil
 
-	if len(key) > MaxKeySize {
+	if len(key) > maxKeySize {
 		return ErrKeyTooLarge
 	}
-	if !tombstone && len(value) > MaxValueSize {
+	if !tombstone && len(value) > maxValueSize {
 		return ErrValueTooLarge
 	}
 
@@ -139,10 +147,10 @@ func Decode(r io.Reader) (Record, error) {
 	// Validate lengths against the size limits *before* allocating, so a corrupt
 	// file with implausible lengths is rejected cleanly instead of triggering a
 	// huge allocation.
-	if keyLen > MaxKeySize {
+	if keyLen > uint32(maxKeySize) {
 		return Record{}, ErrCorrupted
 	}
-	if !tombstone && valueLen > MaxValueSize {
+	if !tombstone && valueLen > uint32(maxValueSize) {
 		return Record{}, ErrCorrupted
 	}
 

@@ -273,37 +273,44 @@ func (db *DB) appendActive(b []byte) error {
 	return nil
 }
 
-// maybeRollover closes the active segment and opens a new one if it has reached
-// the size threshold. Caller must hold db.mu.
+// maybeRollover opens a new active segment if the current one has reached the
+// size threshold. Caller must hold db.mu.
+//
+// Ordering matters for crash/failure safety: the new segment is created and the
+// manifest is committed *before* db.active is switched. If the manifest write
+// fails we discard the new segment and keep writing to the old active, so we
+// never end up appending to a segment that recovery won't see. The old active
+// is left in db.segments with its existing handle (we simply stop appending to
+// it); reads use ReadAt, which doesn't care that the handle is read-write.
 func (db *DB) maybeRollover() error {
 	if db.active.size < db.opts.MaxSegmentBytes {
 		return nil
 	}
-	// Make the active segment immutable: flush, drop the append handle, and
-	// reopen it read-only so in-flight and future reads still work.
 	old := db.active
 	if err := old.sync(); err != nil {
 		return err
 	}
-	if err := old.close(); err != nil {
-		return err
-	}
-	ro, err := openSegmentReadOnly(db.dir, old.id)
-	if err != nil {
-		return err
-	}
-	db.segments[old.id] = ro
 
 	na, err := createSegment(db.dir, db.nextID)
 	if err != nil {
 		return err
 	}
+
+	// Commit the new segment set before exposing it. On failure, the only state
+	// changed on disk is the (now-orphaned) new segment file, which we remove.
+	newOrder := append(append([]uint32(nil), db.order...), na.id)
+	if err := writeManifest(db.dir, manifest{nextID: db.nextID + 1, order: newOrder}); err != nil {
+		na.close()
+		os.Remove(segmentPath(db.dir, na.id))
+		return err
+	}
+
+	// Manifest committed — the rest is infallible in-memory bookkeeping.
 	db.segments[na.id] = na
 	db.active = na
-	db.order = append(db.order, na.id)
+	db.order = newOrder
 	db.nextID++
-	// Persist the new segment set so a crash after this rollover recovers it.
-	return db.writeManifestLocked()
+	return nil
 }
 
 // Get returns the value for key. The second return is false if the key is

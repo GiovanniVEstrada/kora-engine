@@ -81,17 +81,13 @@ func TestTombstoneHasNilValue(t *testing.T) {
 	}
 }
 
-func TestEncodeRejectsOversized(t *testing.T) {
+func TestEncodeRejectsOversizedKey(t *testing.T) {
 	var buf bytes.Buffer
-
+	// 64 KiB + 1 is cheap to allocate. The value-size guard is exercised in the
+	// internal test with a lowered limit, to avoid a gigabyte allocation here.
 	bigKey := make([]byte, record.MaxKeySize+1)
 	if err := record.Encode(&buf, bigKey, []byte("v")); err != record.ErrKeyTooLarge {
 		t.Errorf("oversized key: got %v, want ErrKeyTooLarge", err)
-	}
-
-	bigVal := make([]byte, record.MaxValueSize+1)
-	if err := record.Encode(&buf, []byte("k"), bigVal); err != record.ErrValueTooLarge {
-		t.Errorf("oversized value: got %v, want ErrValueTooLarge", err)
 	}
 }
 

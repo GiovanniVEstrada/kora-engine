@@ -27,8 +27,11 @@ func (db *DB) Compact() error {
 	db.compactMu.Lock()
 	defer db.compactMu.Unlock()
 
-	// 1. Snapshot the immutable segments (everything but the active one) and
-	//    reserve a fresh id for the merged output.
+	// 1. Snapshot the immutable segments (everything but the active one). Only
+	//    reserve a fresh id once we know there's something to compact, so a
+	//    no-op call doesn't advance nextID. (A failed compaction may still
+	//    advance it in memory, but that isn't persisted until the manifest
+	//    commit, so it self-heals on the next Open.)
 	db.mu.Lock()
 	activeID := db.active.id
 	var snap []uint32
@@ -37,13 +40,14 @@ func (db *DB) Compact() error {
 			snap = append(snap, id)
 		}
 	}
+	if len(snap) == 0 {
+		db.mu.Unlock()
+		return nil // nothing to compact
+	}
 	newID := db.nextID
 	db.nextID++
 	db.mu.Unlock()
 
-	if len(snap) == 0 {
-		return nil // nothing to compact
-	}
 	snapSet := make(map[uint32]bool, len(snap))
 	for _, id := range snap {
 		snapSet[id] = true

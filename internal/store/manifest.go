@@ -110,5 +110,27 @@ func readManifest(dir string) (manifest, error) {
 	for i := range order {
 		order[i] = binary.BigEndian.Uint32(payload[12+4*i:])
 	}
+
+	// Semantic validation: a structurally valid (correct-CRC) manifest can still
+	// be logically impossible. Since the manifest is the source of truth, reject
+	// states that would let rollover/compaction reuse a live id or open the same
+	// segment twice.
+	seen := make(map[uint32]bool, len(order))
+	var maxID uint32
+	for _, id := range order {
+		if seen[id] {
+			return manifest{}, errManifestCorrupt // duplicate segment id
+		}
+		seen[id] = true
+		if id > maxID {
+			maxID = id
+		}
+	}
+	if len(order) > 0 && nextID <= maxID {
+		// nextID must be strictly greater than every live id, or the next
+		// allocation would collide with an existing segment.
+		return manifest{}, errManifestCorrupt
+	}
+
 	return manifest{nextID: nextID, order: order}, nil
 }

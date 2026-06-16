@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/giova/strata-engine/internal/store"
@@ -103,6 +104,57 @@ func TestLeakedSegmentIgnoredOnOpen(t *testing.T) {
 	// The leaked file should have been cleaned up.
 	if _, err := os.Stat(leaked); !os.IsNotExist(err) {
 		t.Errorf("expected leaked segment to be removed, stat err=%v", err)
+	}
+}
+
+// TestRolloverManifestFailureKeepsOldActive verifies the High-severity fix: if
+// the manifest write during a rollover fails, the DB must keep writing to the
+// committed old active rather than switching to an uncommitted new segment.
+//
+// The failure is injected cross-platform by creating a *directory* named
+// MANIFEST.tmp, so writeManifest's OpenFile of that path fails.
+func TestRolloverManifestFailureKeepsOldActive(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.Open(dir, store.Options{MaxSegmentBytes: 256, SyncOnWrite: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Push the active segment past the rollover threshold so the *next* write
+	// triggers a rollover.
+	mustSet(t, db, "a", strings.Repeat("x", 300))
+
+	// Sabotage the manifest write.
+	if err := os.Mkdir(filepath.Join(dir, "MANIFEST.tmp"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.Set([]byte("b"), []byte("2")); err == nil {
+		t.Fatal("expected Set to fail when rollover's manifest write fails")
+	}
+
+	// Old data must still be intact and readable through the old active.
+	got, ok, err := db.Get([]byte("a"))
+	if err != nil || !ok || string(got) != strings.Repeat("x", 300) {
+		t.Fatalf("'a' lost after failed rollover: ok=%v err=%v", ok, err)
+	}
+
+	// Remove the sabotage and confirm a clean reopen sees a consistent state.
+	if err := os.Remove(filepath.Join(dir, "MANIFEST.tmp")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db2, err := store.Open(dir, store.Options{MaxSegmentBytes: 256})
+	if err != nil {
+		t.Fatalf("reopen after failed rollover: %v", err)
+	}
+	defer db2.Close()
+	got, ok, err = db2.Get([]byte("a"))
+	if err != nil || !ok || string(got) != strings.Repeat("x", 300) {
+		t.Fatalf("'a' lost after reopen: ok=%v err=%v", ok, err)
 	}
 }
 
