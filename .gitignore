@@ -1,0 +1,19 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+strata-engine
+
+# Test artifacts
+*.test
+*.out
+
+# Data directory (local DB files)
+data/
+
+# Editor
+.idea/
+.vscode/
+*.swp
