@@ -10,6 +10,8 @@
 //	get <key>              print value or (nil)
 //	del <key>              delete key
 //	keys                   print number of live keys
+//	compact                merge immutable segments, reclaiming space
+//	stats                  print live keys, segment count, disk usage
 //	help                   list commands
 //	exit | quit            close and exit
 package main
@@ -27,9 +29,10 @@ import (
 func main() {
 	dir := flag.String("dir", "./data", "data directory")
 	noSync := flag.Bool("no-sync", false, "disable fsync on every write (faster, less durable)")
+	seg := flag.Int64("seg", 0, "max segment size in bytes before rollover (0 = default 4 MiB)")
 	flag.Parse()
 
-	db, err := store.Open(*dir, store.Options{SyncOnWrite: !*noSync})
+	db, err := store.Open(*dir, store.Options{SyncOnWrite: !*noSync, MaxSegmentBytes: *seg})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "open:", err)
 		os.Exit(1)
@@ -101,8 +104,19 @@ func dispatch(db *store.DB, line string) bool {
 	case "keys":
 		fmt.Println(db.Len())
 
+	case "compact":
+		if err := db.Compact(); err != nil {
+			fmt.Println("ERR", err)
+			return false
+		}
+		fmt.Println("OK")
+
+	case "stats":
+		fmt.Printf("keys=%d segments=%d disk=%d bytes\n",
+			db.Len(), db.SegmentCount(), db.DiskUsage())
+
 	case "help":
-		fmt.Println("commands: set <k> <v> | get <k> | del <k> | keys | help | exit")
+		fmt.Println("commands: set <k> <v> | get <k> | del <k> | keys | compact | stats | help | exit")
 
 	case "exit", "quit":
 		return true

@@ -46,7 +46,15 @@ func Size(r Record) int {
 //
 // CRC covers everything after itself so a reader can stream-validate without
 // seeking back.
+//
+// The timestamp is set to the current time; use EncodeAt to supply one
+// explicitly (compaction does this to preserve a record's original timestamp).
 func Encode(w io.Writer, key, value []byte) error {
+	return EncodeAt(w, uint64(time.Now().UnixMilli()), key, value)
+}
+
+// EncodeAt is Encode with an explicit timestamp.
+func EncodeAt(w io.Writer, ts uint64, key, value []byte) error {
 	tombstone := value == nil
 
 	var valueLen uint32
@@ -56,7 +64,6 @@ func Encode(w io.Writer, key, value []byte) error {
 		valueLen = uint32(len(value))
 	}
 
-	ts := uint64(time.Now().UnixMilli())
 	keyLen := uint32(len(key))
 
 	var meta [16]byte
