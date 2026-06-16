@@ -16,30 +16,34 @@ import (
 // active segment) keep working throughout. Only the final swap takes the write
 // lock briefly. Just one compaction runs at a time.
 //
-// Correctness rests on the invariant that ascending segment id == ascending
-// recency (see DESIGN.md): the merged output reuses the *minimum* id of its
-// inputs, so it stays older than the active segment and any segment created by
-// a rollover while compaction was running.
+// Crash/failure safety: the merged output is written to a brand-new segment id
+// (never overwriting an existing file, which also sidesteps Windows' open-handle
+// restrictions). The swap is committed by atomically replacing the manifest;
+// everything before that point is invisible to recovery, and everything after
+// is durable. In-memory state is mutated only once the new segment is open and
+// the manifest is committed, so a failure mid-swap never leaves the keydir
+// pointing at a segment that isn't present.
 func (db *DB) Compact() error {
 	db.compactMu.Lock()
 	defer db.compactMu.Unlock()
 
-	// 1. Snapshot the set of immutable segments (everything but the active one).
-	db.mu.RLock()
+	// 1. Snapshot the immutable segments (everything but the active one) and
+	//    reserve a fresh id for the merged output.
+	db.mu.Lock()
 	activeID := db.active.id
 	var snap []uint32
-	for id := range db.segments {
+	for _, id := range db.order {
 		if id != activeID {
 			snap = append(snap, id)
 		}
 	}
-	db.mu.RUnlock()
+	newID := db.nextID
+	db.nextID++
+	db.mu.Unlock()
 
 	if len(snap) == 0 {
 		return nil // nothing to compact
 	}
-	sortIDs(snap)
-	minID := snap[0]
 	snapSet := make(map[uint32]bool, len(snap))
 	for _, id := range snap {
 		snapSet[id] = true
@@ -58,10 +62,11 @@ func (db *DB) Compact() error {
 		}
 	}
 
-	// 3. Write the live (non-tombstone) records to a temp file, recording where
-	//    each landed. Tombstones are dropped: we merged every segment older than
-	//    the active one, so a delete here has no older value left to mask.
-	tmpPath := segmentPath(db.dir, minID) + ".compacting"
+	// 3. Write live (non-tombstone) records to a temp file, recording where each
+	//    lands. Tombstones are dropped: we merged every segment older than the
+	//    active one, so a delete here has no older value left to mask.
+	finalPath := segmentPath(db.dir, newID)
+	tmpPath := finalPath + ".compacting"
 	tmp, err := os.OpenFile(tmpPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err
@@ -83,7 +88,7 @@ func (db *DB) Compact() error {
 			os.Remove(tmpPath)
 			return err
 		}
-		newEntries[key] = entry{fileID: minID, offset: off, length: buf.Len()}
+		newEntries[key] = entry{fileID: newID, offset: off, length: buf.Len()}
 		off += int64(buf.Len())
 	}
 	if err := tmp.Sync(); err != nil {
@@ -95,44 +100,61 @@ func (db *DB) Compact() error {
 		os.Remove(tmpPath)
 		return err
 	}
+	if err := os.Rename(tmpPath, finalPath); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
 
-	// 4. Swap (locked): repoint the keydir, drop the old segments, and install
-	//    the merged one. Fast relative to the merge above.
+	// 4. Swap (locked). Do every fallible step (open the merged segment, commit
+	//    the manifest) before mutating the keydir / segment set, so a failure
+	//    leaves the DB exactly as it was.
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	// Only repoint keys whose newest record still lives in a snapshot segment.
-	// If a key was overwritten or deleted in the active (or a post-snapshot)
-	// segment while we merged, that newer write must win — leave it alone.
+	merged, err := openSegmentReadOnly(db.dir, newID)
+	if err != nil {
+		os.Remove(finalPath) // leaked output; manifest never referenced it
+		return err
+	}
+
+	// New recency order: merged (oldest) first, then everything that was newer
+	// than the snapshot (post-snapshot rollovers + the active segment).
+	newOrder := []uint32{newID}
+	for _, id := range db.order {
+		if !snapSet[id] {
+			newOrder = append(newOrder, id)
+		}
+	}
+
+	// Commit point: atomically replace the manifest. Until this succeeds the
+	// merged file is invisible to recovery.
+	oldOrder := db.order
+	db.order = newOrder
+	if err := db.writeManifestLocked(); err != nil {
+		db.order = oldOrder // roll back in-memory order
+		merged.close()
+		os.Remove(finalPath)
+		return err
+	}
+
+	// Manifest committed — now it's safe to update in-memory state. Repoint only
+	// keys whose newest record still lives in a snapshot segment; a newer write
+	// to the active segment during the merge must win.
+	db.segments[newID] = merged
 	for key, ne := range newEntries {
 		if cur, ok := db.keydir[key]; ok && snapSet[cur.fileID] {
 			db.keydir[key] = ne
 		}
 	}
 
-	// Close and remove the old snapshot segment files.
+	// Retire the old snapshot segments (best-effort file removal — they're no
+	// longer in the manifest, so a failure only leaks disk).
 	for _, id := range snap {
 		if seg := db.segments[id]; seg != nil {
 			seg.close()
 			delete(db.segments, id)
 		}
+		os.Remove(segmentPath(db.dir, id))
 	}
-	if err := os.Remove(segmentPath(db.dir, minID)); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	if err := os.Rename(tmpPath, segmentPath(db.dir, minID)); err != nil {
-		return err
-	}
-	for _, id := range snap[1:] {
-		if err := os.Remove(segmentPath(db.dir, id)); err != nil && !os.IsNotExist(err) {
-			return err
-		}
-	}
-
-	merged, err := openSegmentReadOnly(db.dir, minID)
-	if err != nil {
-		return err
-	}
-	db.segments[minID] = merged
 	return nil
 }

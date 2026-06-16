@@ -12,8 +12,27 @@ import (
 // Chosen over a flag byte to keep the header fixed-width (always 20 bytes).
 const TombstoneSentinel uint32 = 0xFFFFFFFF
 
-// ErrCorrupted is returned when a record's CRC does not match its contents.
+// Size limits. These bound how much memory a single record can ask us to
+// allocate, which matters in two places: Encode rejects oversized inputs
+// instead of silently truncating len() to uint32, and Decode rejects
+// implausible on-disk lengths *before* allocating, so a corrupt file can't
+// trigger a huge allocation / OOM. Both caps sit well below math.MaxUint32, so
+// there is also no overflow when summing key+value lengths.
+const (
+	MaxKeySize   = 1 << 16 // 64 KiB — keys are identifiers, not payloads
+	MaxValueSize = 1 << 30 // 1 GiB
+)
+
+// ErrCorrupted is returned when a record's CRC does not match its contents, or
+// when its on-disk lengths exceed the size limits (a sign of corruption).
 var ErrCorrupted = errors.New("record: checksum mismatch")
+
+// ErrKeyTooLarge / ErrValueTooLarge are returned by Encode when an input
+// exceeds the size limits.
+var (
+	ErrKeyTooLarge   = errors.New("record: key exceeds MaxKeySize")
+	ErrValueTooLarge = errors.New("record: value exceeds MaxValueSize")
+)
 
 // Record is the in-memory representation of a single log entry.
 // Value == nil means this is a tombstone (delete marker).
@@ -53,9 +72,17 @@ func Encode(w io.Writer, key, value []byte) error {
 	return EncodeAt(w, uint64(time.Now().UnixMilli()), key, value)
 }
 
-// EncodeAt is Encode with an explicit timestamp.
+// EncodeAt is Encode with an explicit timestamp. It returns ErrKeyTooLarge or
+// ErrValueTooLarge rather than silently truncating an oversized length.
 func EncodeAt(w io.Writer, ts uint64, key, value []byte) error {
 	tombstone := value == nil
+
+	if len(key) > MaxKeySize {
+		return ErrKeyTooLarge
+	}
+	if !tombstone && len(value) > MaxValueSize {
+		return ErrValueTooLarge
+	}
 
 	var valueLen uint32
 	if tombstone {
@@ -108,6 +135,16 @@ func Decode(r io.Reader) (Record, error) {
 	valueLen := binary.BigEndian.Uint32(hdr[16:20])
 
 	tombstone := valueLen == TombstoneSentinel
+
+	// Validate lengths against the size limits *before* allocating, so a corrupt
+	// file with implausible lengths is rejected cleanly instead of triggering a
+	// huge allocation.
+	if keyLen > MaxKeySize {
+		return Record{}, ErrCorrupted
+	}
+	if !tombstone && valueLen > MaxValueSize {
+		return Record{}, ErrCorrupted
+	}
 
 	tailSize := int(keyLen)
 	if !tombstone {

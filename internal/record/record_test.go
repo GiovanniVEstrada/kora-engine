@@ -81,6 +81,40 @@ func TestTombstoneHasNilValue(t *testing.T) {
 	}
 }
 
+func TestEncodeRejectsOversized(t *testing.T) {
+	var buf bytes.Buffer
+
+	bigKey := make([]byte, record.MaxKeySize+1)
+	if err := record.Encode(&buf, bigKey, []byte("v")); err != record.ErrKeyTooLarge {
+		t.Errorf("oversized key: got %v, want ErrKeyTooLarge", err)
+	}
+
+	bigVal := make([]byte, record.MaxValueSize+1)
+	if err := record.Encode(&buf, []byte("k"), bigVal); err != record.ErrValueTooLarge {
+		t.Errorf("oversized value: got %v, want ErrValueTooLarge", err)
+	}
+}
+
+// TestDecodeRejectsImplausibleLengths feeds a header claiming a gigantic key
+// length. Decode must reject it as corruption *without* trying to allocate that
+// much (i.e. it must not OOM).
+func TestDecodeRejectsImplausibleLengths(t *testing.T) {
+	// Build a header by hand: keyLen claims ~4 GiB.
+	hdr := make([]byte, record.HeaderSize)
+	// hdr layout: crc(4) ts(8) keyLen(4) valueLen(4). Set keyLen huge.
+	hdr[12] = 0xFF
+	hdr[13] = 0xFF
+	hdr[14] = 0xFF
+	hdr[15] = 0x00 // keyLen = 0xFFFFFF00, far above MaxKeySize
+	// valueLen left 0. The CRC (hdr[0:4]) is garbage, but the length check
+	// happens before CRC validation, so we expect ErrCorrupted either way.
+
+	_, err := record.Decode(bytes.NewReader(hdr))
+	if err != record.ErrCorrupted {
+		t.Fatalf("got %v, want ErrCorrupted", err)
+	}
+}
+
 func TestEmptyValueIsNotTombstone(t *testing.T) {
 	var buf bytes.Buffer
 	if err := record.Encode(&buf, []byte("k"), []byte{}); err != nil {

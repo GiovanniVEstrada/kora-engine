@@ -86,13 +86,13 @@ func TestCompactionDropsTombstones(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	val := bytes.Repeat([]byte("z"), 200)
+	val := string(bytes.Repeat([]byte("z"), 200))
 	for i := 0; i < 30; i++ {
-		db.Set([]byte(fmt.Sprintf("d%02d", i)), val)
+		mustSet(t, db, fmt.Sprintf("d%02d", i), val)
 	}
 	// Delete half of them.
 	for i := 0; i < 30; i += 2 {
-		db.Delete([]byte(fmt.Sprintf("d%02d", i)))
+		mustDelete(t, db, fmt.Sprintf("d%02d", i))
 	}
 	if err := db.Compact(); err != nil {
 		t.Fatal(err)
@@ -160,11 +160,11 @@ func TestOracleWithRolloverAndCompaction(t *testing.T) {
 	for i := 0; i < 8000; i++ {
 		k := keys[rng.Intn(len(keys))]
 		if rng.Intn(4) == 0 {
-			db.Delete([]byte(k))
+			mustDelete(t, db, k)
 			delete(oracle, k)
 		} else {
 			v := fmt.Sprintf("val-%d-%d", i, rng.Intn(1000))
-			db.Set([]byte(k), []byte(v))
+			mustSet(t, db, k, v)
 			oracle[k] = v
 		}
 		if i%1000 == 999 {
@@ -195,9 +195,9 @@ func TestConcurrentReadsDuringCompaction(t *testing.T) {
 	}
 	defer db.Close()
 
-	val := bytes.Repeat([]byte("c"), 100)
+	val := string(bytes.Repeat([]byte("c"), 100))
 	for i := 0; i < 100; i++ {
-		db.Set([]byte(fmt.Sprintf("key%03d", i)), val)
+		mustSet(t, db, fmt.Sprintf("key%03d", i), val)
 	}
 
 	var wg sync.WaitGroup
@@ -221,7 +221,7 @@ func TestConcurrentReadsDuringCompaction(t *testing.T) {
 					t.Errorf("Get error: %v", err)
 					return
 				}
-				if !ok || !bytes.Equal(got, val) {
+				if !ok || string(got) != val {
 					t.Errorf("key%03d: ok=%v len=%d", i, ok, len(got))
 					return
 				}
@@ -248,7 +248,7 @@ func TestCompactNoImmutableSegmentsIsNoop(t *testing.T) {
 	}
 	defer db.Close()
 
-	db.Set([]byte("a"), []byte("1"))
+	mustSet(t, db, "a", "1")
 	before := db.SegmentCount()
 	if err := db.Compact(); err != nil {
 		t.Fatal(err)

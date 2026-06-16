@@ -50,7 +50,8 @@ type DB struct {
 	dir      string
 	opts     Options
 	segments map[uint32]*segment // all readable segments, including active
-	active   *segment            // current append target (always the max id)
+	active   *segment            // current append target (always order's last)
+	order    []uint32            // segment ids oldest → newest; recency order
 	keydir   map[string]entry
 	nextID   uint32
 
@@ -81,31 +82,72 @@ func Open(dir string, opts Options) (*DB, error) {
 	return db, nil
 }
 
-// load discovers existing segments and rebuilds the keydir. Segments are
-// scanned in ascending id order, which equals ascending recency (see
-// DESIGN.md), so later records simply win and tombstones remove keys.
+// load rebuilds in-memory state at startup. The manifest is authoritative: it
+// lists the live segments in recency order. If there is no manifest yet (a
+// fresh store, or one created by pre-manifest code), we bootstrap one.
 func (db *DB) load() error {
+	m, err := readManifest(db.dir)
+	switch {
+	case err == errNoManifest:
+		return db.bootstrap()
+	case err != nil:
+		// A corrupt manifest can't be safely reconstructed by scanning the
+		// directory, because compaction no longer keeps id order == recency
+		// order. Surface it rather than guessing.
+		return err
+	}
+	if len(m.order) == 0 {
+		return errManifestCorrupt // a real store always has at least one segment
+	}
+
+	if err := db.openAndScan(m.order); err != nil {
+		return err
+	}
+	db.nextID = m.nextID
+	// Remove any segment files not named by the manifest — leaked output from a
+	// compaction that crashed before committing its manifest.
+	db.cleanupLeakedSegments()
+	return nil
+}
+
+// bootstrap creates the manifest for a store that doesn't have one: either a
+// fresh directory, or one written by the pre-manifest M2 code (where ascending
+// id order equalled recency, so we can migrate by sorting ids).
+func (db *DB) bootstrap() error {
 	ids, err := listSegmentIDs(db.dir)
 	if err != nil {
 		return err
 	}
 
 	if len(ids) == 0 {
-		// Fresh store: create the first active segment.
 		seg, err := createSegment(db.dir, 1)
 		if err != nil {
 			return err
 		}
 		db.segments[1] = seg
 		db.active = seg
+		db.order = []uint32{1}
 		db.nextID = 2
-		return nil
+		return db.writeManifestLocked()
 	}
 
-	for i, id := range ids {
-		isActive := i == len(ids)-1
+	if err := db.openAndScan(ids); err != nil {
+		return err
+	}
+	db.nextID = ids[len(ids)-1] + 1
+	return db.writeManifestLocked()
+}
+
+// openAndScan opens every segment named in order (oldest → newest), rebuilding
+// the keydir by replaying each in turn. The last id is the active segment. A
+// partial trailing record in the active segment is truncated away; one in an
+// immutable segment is treated as corruption. Caller sets db.nextID.
+func (db *DB) openAndScan(order []uint32) error {
+	for i, id := range order {
+		isActive := i == len(order)-1
 
 		var seg *segment
+		var err error
 		if isActive {
 			seg, err = createSegment(db.dir, id)
 		} else {
@@ -128,7 +170,6 @@ func (db *DB) load() error {
 		switch {
 		case serr == errPartialTail:
 			if !isActive {
-				// Only the newest segment should ever have a partial tail.
 				return errors.New("store: partial record in immutable segment " + seg.path)
 			}
 			if terr := seg.f.Truncate(end); terr != nil {
@@ -143,10 +184,34 @@ func (db *DB) load() error {
 
 		if isActive {
 			db.active = seg
-			db.nextID = id + 1
 		}
 	}
+	db.order = append([]uint32(nil), order...)
 	return nil
+}
+
+// writeManifestLocked persists the current segment set. Caller must hold db.mu
+// (or be in single-threaded startup).
+func (db *DB) writeManifestLocked() error {
+	return writeManifest(db.dir, manifest{nextID: db.nextID, order: db.order})
+}
+
+// cleanupLeakedSegments removes *.data files whose id is not in the live set.
+// Best-effort: failures are ignored (leaked disk, not a correctness problem).
+func (db *DB) cleanupLeakedSegments() {
+	ids, err := listSegmentIDs(db.dir)
+	if err != nil {
+		return
+	}
+	live := make(map[uint32]bool, len(db.order))
+	for _, id := range db.order {
+		live[id] = true
+	}
+	for _, id := range ids {
+		if !live[id] {
+			os.Remove(segmentPath(db.dir, id))
+		}
+	}
 }
 
 // Set stores value under key. A nil value is normalized to empty so it is not
@@ -235,8 +300,10 @@ func (db *DB) maybeRollover() error {
 	}
 	db.segments[na.id] = na
 	db.active = na
+	db.order = append(db.order, na.id)
 	db.nextID++
-	return nil
+	// Persist the new segment set so a crash after this rollover recovers it.
+	return db.writeManifestLocked()
 }
 
 // Get returns the value for key. The second return is false if the key is

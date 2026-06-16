@@ -67,26 +67,40 @@ as an error rather than silently skipped.
 
 ---
 
-## Segments and the recency invariant (M2)
+## Segments and rollover (M2)
 
 The single log is replaced by a series of numbered segment files
-(`000001.data`, `000002.data`, …). One segment is *active* (append target);
+(`000001.data`, `000002.data`, ...). One segment is *active* (append target);
 the rest are immutable. When the active segment reaches `MaxSegmentBytes` it is
 flushed, reopened read-only, and a new active segment is created. The keydir
 entry gains a `fileID` so a read knows which segment to seek into.
 
-**The core invariant: ascending segment id == ascending recency.** A higher id
-is always newer. This makes recovery trivial — scan segments in ascending id
-order, exactly like the M1 single-file scan, and later records win. The active
-segment always holds the maximum id (new actives are allocated from a
-monotonic counter).
+## Recency: from id-order to the manifest (M2)
 
-**Why id ordering matters even though the keydir is authoritative at runtime:**
-the keydir always points at the truly newest record while the process is live,
-so id order is irrelevant for online reads. But after a crash the keydir is
-*gone* and must be rebuilt by scanning files. If a segment's id didn't reflect
-its recency, the scan could pick a stale value as the winner. Compaction is
-designed to preserve this invariant (below).
+**Recency is recorded explicitly by the `MANIFEST`, not inferred from segment
+ids.** The manifest lists the live segments in order oldest -> newest; the last
+is the active segment. Recovery reads the manifest and replays those segments in
+that order, so later records win and tombstones remove keys.
+
+An earlier version of M2 relied on the invariant *ascending id == ascending
+recency* and reconstructed state by sorting filenames. That was abandoned for
+two reasons: (1) it made compaction fragile (the merged output had to reuse the
+minimum input id to stay "old," which meant overwriting an existing file — a
+problem on Windows, see below); and (2) a directory scan can't distinguish a
+live segment from a file leaked by a compaction that crashed before finishing.
+The manifest solves both: ids are now just unique names, and recency lives in
+the manifest. (The startup path still *migrates* a pre-manifest directory by
+sorting ids once, then writes a manifest.)
+
+**Manifest format** (big-endian, CRC-first like the record format):
+
+```
+[crc32 (4)] [version (4)] [nextID (4)] [count (4)] [id_0 (4)] ... [id_{count-1} (4)]
+```
+
+It is updated atomically: write `MANIFEST.tmp`, fsync, then `rename` over
+`MANIFEST`. `rename` is atomic, so the manifest a reader sees is always either
+the complete old one or the complete new one — never a torn write.
 
 ## Compaction (M2)
 
@@ -100,13 +114,13 @@ the merged set provably masks nothing that survives, so it can be discarded.
 The active segment is strictly newer, so it never holds an older value to worry
 about.
 
-**Why the merged output reuses the minimum input id:** the merged data is older
-than the active segment and older than anything a concurrent rollover creates
-mid-compaction. Reusing the smallest input id keeps the merged segment below
-those in id order, preserving *ascending id == ascending recency*. The active
-segment keeps its max id; recovery still works unchanged. (Consequence: the
-merged segment may exceed `MaxSegmentBytes`. Acceptable for M2 — M3's leveled
-SSTable compaction addresses output sizing.)
+**Why the merged output gets a brand-new id:** because recency is in the
+manifest, the merged segment doesn't need a "low" id to be treated as old — the
+manifest simply lists it first. Writing to a fresh id means we never overwrite
+an existing file, which removes the Windows open-handle hazard entirely and
+makes the merged file invisible to recovery until the manifest names it.
+(Consequence: the merged segment may exceed `MaxSegmentBytes`. Acceptable for
+M2 — M3's leveled SSTable compaction addresses output sizing.)
 
 **Preserving original timestamps:** merged records are re-encoded with
 `record.EncodeAt` using each record's *original* timestamp, so the timestamp
@@ -116,12 +130,27 @@ compacted).
 ## Safe swap & concurrency (M2)
 
 Compaction's expensive phase — reading every immutable segment and writing the
-merged output to a temp file — runs **without the write lock**. Immutable
-segments never change, so this is safe, and writes to the active segment
-continue throughout. Only the final swap takes the write lock: it repoints
-keydir entries, closes/deletes the old segment files, renames the temp file
-into place, and opens the merged segment. A single `compactMu` ensures only one
+merged output — runs **without the write lock**. Immutable segments never
+change, so this is safe, and writes to the active segment continue throughout.
+Only the final swap takes the write lock. A single `compactMu` ensures only one
 compaction runs at a time.
+
+**The commit point is the manifest rename.** The swap is ordered so that every
+fallible step happens before any in-memory state changes:
+
+1. open the merged segment (read-only);
+2. atomically replace the manifest with the new segment list (the durable
+   commit — on failure we roll back the in-memory order and delete the merged
+   file, leaving the DB exactly as it was);
+3. *only then* install the merged segment in the map and repoint keydir entries;
+4. retire the old segments (best-effort file deletion — a failure here only
+   leaks disk, never corrupts state).
+
+This directly fixes the original review finding: the keydir is never repointed
+to a segment that isn't open and named by a committed manifest. A crash at any
+moment leaves a consistent state — either the old manifest (merge never
+happened) or the new one (merge fully applied); leaked `*.data` files not named
+by the manifest are deleted on the next `Open`.
 
 **The swap's correctness rule:** a key is repointed to the merged segment
 *only if its current keydir entry still lives in one of the snapshotted
@@ -132,14 +161,23 @@ what makes it safe to merge lock-free against a live, writable database.
 **Reads during compaction:** `Get` holds the read lock across the actual disk
 read (not just the keydir lookup). That way the brief write-locked swap cannot
 close a segment file out from under an in-flight read. The cost is that reads
-block for the duration of the swap (a few file operations); a future
-optimization is epoch/refcount-based reclamation that avoids blocking reads at
-all. *(Note: the concurrency test validates correct values under concurrent
-reads + compaction; running it under Go's `-race` detector requires a C
-toolchain, which isn't assumed here.)*
+block for the duration of the swap; a future optimization is epoch/refcount-
+based reclamation that avoids blocking reads at all. *(The concurrency test
+validates correct values under concurrent reads + compaction; running it under
+Go's `-race` detector requires a C toolchain, which isn't assumed here.)*
 
-**Windows file semantics:** unlike POSIX, Windows won't let you delete or rename
-a file with an open handle, so the swap closes old segment handles *before*
-removing/renaming their files. This ordering leaves a small window where a
-failure between delete and rename is unrecoverable — noted as a known M2
-limitation; M4's WAL and a proper manifest would make the swap atomic.
+**Windows file semantics:** unlike POSIX, Windows won't delete or rename a file
+with an open handle. Writing merged output to a fresh id (never overwriting an
+open file) and committing via an atomic manifest rename means the swap no longer
+depends on close-before-delete ordering for correctness — old-segment deletion
+is now pure best-effort cleanup.
+
+## Record size limits (M2 hardening)
+
+`Encode` rejects keys larger than `MaxKeySize` (64 KiB) or values larger than
+`MaxValueSize` (1 GiB) with a typed error, rather than silently truncating
+`len()` into a `uint32`. `Decode` enforces the same caps on the on-disk lengths
+*before allocating*, so a corrupted file claiming a multi-gigabyte key is
+rejected as `ErrCorrupted` instead of triggering a huge allocation or OOM. Both
+caps sit well below `math.MaxUint32`, so summing key+value lengths can't
+overflow.

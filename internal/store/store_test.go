@@ -20,6 +20,22 @@ func openTemp(t *testing.T) (*store.DB, string) {
 	return db, dir
 }
 
+// mustSet / mustDelete fail the test on a write error. In a storage engine,
+// write failures matter, so tests should never silently ignore them.
+func mustSet(t *testing.T, db *store.DB, key, value string) {
+	t.Helper()
+	if err := db.Set([]byte(key), []byte(value)); err != nil {
+		t.Fatalf("Set(%q): %v", key, err)
+	}
+}
+
+func mustDelete(t *testing.T, db *store.DB, key string) {
+	t.Helper()
+	if err := db.Delete([]byte(key)); err != nil {
+		t.Fatalf("Delete(%q): %v", key, err)
+	}
+}
+
 func TestSetGet(t *testing.T) {
 	db, _ := openTemp(t)
 
@@ -48,8 +64,8 @@ func TestGetMissing(t *testing.T) {
 
 func TestOverwrite(t *testing.T) {
 	db, _ := openTemp(t)
-	db.Set([]byte("k"), []byte("v1"))
-	db.Set([]byte("k"), []byte("v2"))
+	mustSet(t, db, "k", "v1")
+	mustSet(t, db, "k", "v2")
 
 	got, _, _ := db.Get([]byte("k"))
 	if !bytes.Equal(got, []byte("v2")) {
@@ -59,10 +75,8 @@ func TestOverwrite(t *testing.T) {
 
 func TestDelete(t *testing.T) {
 	db, _ := openTemp(t)
-	db.Set([]byte("k"), []byte("v"))
-	if err := db.Delete([]byte("k")); err != nil {
-		t.Fatal(err)
-	}
+	mustSet(t, db, "k", "v")
+	mustDelete(t, db, "k")
 	_, ok, _ := db.Get([]byte("k"))
 	if ok {
 		t.Fatal("expected key to be gone after delete")
@@ -71,7 +85,7 @@ func TestDelete(t *testing.T) {
 
 func TestEmptyValueIsNotDelete(t *testing.T) {
 	db, _ := openTemp(t)
-	db.Set([]byte("k"), []byte{})
+	mustSet(t, db, "k", "")
 	got, ok, err := db.Get([]byte("k"))
 	if err != nil {
 		t.Fatal(err)
@@ -93,11 +107,11 @@ func TestReopenDurability(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	db.Set([]byte("a"), []byte("1"))
-	db.Set([]byte("b"), []byte("2"))
-	db.Set([]byte("a"), []byte("3")) // overwrite: later wins
-	db.Delete([]byte("b"))           // tombstone: should be gone after reopen
-	db.Set([]byte("c"), []byte("4"))
+	mustSet(t, db, "a", "1")
+	mustSet(t, db, "b", "2")
+	mustSet(t, db, "a", "3") // overwrite: later wins
+	mustDelete(t, db, "b")   // tombstone: should be gone after reopen
+	mustSet(t, db, "c", "4")
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
