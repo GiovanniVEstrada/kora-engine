@@ -27,6 +27,16 @@ func IsTombstone(r Record) bool {
 	return r.Value == nil
 }
 
+// HeaderSize is the fixed-width header: crc(4) + timestamp(8) + key_len(4) + value_len(4).
+const HeaderSize = 20
+
+// Size returns the number of bytes r occupies on disk once encoded.
+// A tombstone (Value == nil) and an empty value both contribute 0 value bytes,
+// so this matches the encoded length in either case.
+func Size(r Record) int {
+	return HeaderSize + len(r.Key) + len(r.Value)
+}
+
 // Encode serializes key+value as a record and writes it to w.
 // Pass value == nil to write a tombstone.
 //
