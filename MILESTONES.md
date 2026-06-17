@@ -231,12 +231,12 @@ memtable is flushed.
 Concepts: write-ahead logging, the durability-vs-performance tradeoff, atomicity,
 checkpointing.
 
-- [ ] **WAL append:** before applying a write to the memtable, append it to a WAL
+- [x] **WAL append:** before applying a write to the memtable, append it to a WAL
   file and `fsync`. Only then acknowledge the write.
-- [ ] **Recovery:** on startup, replay the WAL into a fresh memtable.
-- [ ] **Checkpoint:** after a memtable is safely flushed to an SSTable, discard
+- [x] **Recovery:** on startup, replay the WAL into a fresh memtable.
+- [x] **Checkpoint:** after a memtable is safely flushed to an SSTable, discard
   (or rotate) the corresponding WAL.
-- [ ] **Crash test it** — this is the milestone you prove, not just claim.
+- [x] **Crash test it** — this is the milestone you prove, not just claim.
 
 **Done when:** you can `kill -9` mid-write, restart, and every acknowledged write
 is present.

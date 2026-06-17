@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 
 	"github.com/giova/kora-engine/internal/bloom"
 )
@@ -25,6 +26,7 @@ type indexEntry struct {
 type Reader struct {
 	f         *os.File
 	path      string // file path, used by compaction for cleanup
+	id        uint32 // numeric ID parsed from the file name
 	index     []indexEntry
 	filter    *bloom.Filter
 	dataEnd   int64  // byte offset where the data section ends (= bloom start)
@@ -40,13 +42,19 @@ func Open(path string) (*Reader, error) {
 		return nil, err
 	}
 
-	r := &Reader{f: f, path: path}
+	var id uint32
+	fmt.Sscanf(filepath.Base(path), "%d.sst", &id)
+
+	r := &Reader{f: f, path: path, id: id}
 	if err := r.loadFooterAndIndex(); err != nil {
 		f.Close()
 		return nil, err
 	}
 	return r, nil
 }
+
+// ID returns the numeric file ID embedded in the SSTable's file name.
+func (r *Reader) ID() uint32 { return r.id }
 
 // Get returns the value for key. Returns (nil, false, nil) if the key is not
 // present or has a tombstone. Returns a non-nil error only on I/O or corruption.

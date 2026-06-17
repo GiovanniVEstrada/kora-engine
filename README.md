@@ -10,8 +10,24 @@ LSM-tree with crash recovery and a network server.
 - [x] M1 — Append-only KV store with in-memory hash index
 - [x] M2 — Multiple segments + compaction
 - [x] M3 — LSM-tree (ART memtable · SSTables · Bloom filters · range scans)
-- [ ] M4 — Write-ahead log & crash recovery
+- [x] M4 — WAL checkpoint & crash recovery
 - [ ] M5 — TCP server
+
+> **Heads-up — active development.** The items below are known gaps that the
+> next milestones will address. Anything marked M5 may change APIs or on-disk
+> formats before it ships.
+>
+> - **No network access yet.** The only interface is the local REPL (`go run
+>   ./cmd/kora`). A TCP server speaking the Postgres wire protocol is planned
+>   for M5.
+> - **Single-process only.** No client library, no remote connections. All
+>   reads and writes go through the Go API or the REPL in the same process.
+> - **No transactions or MVCC.** Every write is immediately visible to all
+>   readers. Snapshot isolation and multi-statement transactions are post-M5
+>   stretch goals.
+> - **Segment WAL is legacy.** The M1/M2 Bitcask-style segment log is still
+>   present alongside the LSM write path. A future cleanup will retire it once
+>   the LSM WAL fully supersedes it.
 
 See [MILESTONES.md](MILESTONES.md) for the full roadmap and
 [DESIGN.md](DESIGN.md) for tradeoff notes.
@@ -62,43 +78,55 @@ segment WAL for durability and an in-memory sorted memtable for fast reads.
 When the memtable reaches its size threshold it is flushed as an immutable
 SSTable. Reads check the memtable first, then SSTables newest-to-oldest.
 
-```
-  Set / Delete                              Get / Scan
-       |                                         |
-       v                                         v
-+------+----------+          +-----------------+-----------------+
-| segment WAL     |          | 1. memtable (ART)  — O(k) lookup |
-| (append-only)   |          |    tombstone{} marks deleted keys |
-+------+----------+          |                                   |
-       |                     | 2. SSTables  newest → oldest      |
-       v                     |    a. Bloom filter → skip on miss |
-+------+----------+          |    b. sparse index → seek near key|
-| memtable (ART)  |          |    c. linear scan ≤ 16 records    |
-| sorted, in RAM  |          +-----------+-----------------------+
-+----+------------+                      |
-     | memSize ≥ MaxMemBytes             | Scan: k-way merge over
-     v                                   | memtable + all SSTables,
-+----+--------+                          | snapshot under RLock
-| flush       |
-+----+--------+
-     |
-     v  (prepend to ssReaders — newest first)
-+----+--------+   +------------+   +------------+
-| SSTable  N  |   | SSTable N-1|   | SSTable N-2|  ...
-| bloom+index |   | bloom+index|   | bloom+index|
-+------+------+   +------+-----+   +------+-----+
-       |                 |                |
-       +--------+--------+----------------+
-                | CompactSSTables(): k-way merge all SSTables,
-                | keep newest version per key, drop tombstones,
-                v atomic swap (write lock), delete old files
-         +------+------+
-         | SSTable out |
-         | (one file)  |
-         +-------------+
+```mermaid
+%%{init: {'theme':'base','themeVariables':{'fontFamily':'ui-monospace, Menlo, monospace','lineColor':'#7d7264','primaryTextColor':'#2b2722','fontSize':'13px'}}}%%
+flowchart TB
+  client(["CLI / application"])
 
-On Open: read MANIFEST → replay segment WAL → rebuild memtable
-         delete prior-session SSTables (session-local in M3)
+  subgraph L1["interface"]
+    repl["REPL · cmd/kora\nset  get  del  scan  compact  stats"]
+  end
+
+  subgraph L2["engine · internal/store"]
+    db["DB\nSet · Get · Delete · Scan · Compact"]
+    manifest["MANIFEST\ncrash-safe commit point\nlive WAL segments + durable SSTable IDs"]
+    db <-->|"atomic swap\n(write-temp → fsync → rename)"| manifest
+  end
+
+  subgraph L3["storage · internal/*"]
+    subgraph wpath["write path"]
+      wal["WAL segment\nCRC-framed · fsync'd\ninternal/record"]
+      art["ART memtable\nO(key-len) · sorted · Node4/16/48/256\ninternal/art"]
+    end
+    subgraph sstfiles["SSTables · internal/sstable"]
+      sw["writer · flush when memSize ≥ threshold\ndata · bloom · sparse index · footer"]
+      sr["reader\nbloom filter → sparse index → data scan"]
+    end
+    art -->|"memSize ≥ MaxMemBytes"| sw
+    sw -.->|"open after write"| sr
+  end
+
+  tcp(["TCP server · M5 · planned"])
+  os[("OS · file storage")]
+
+  client --> repl --> db
+  tcp -.-> db
+  db -->|"every write · fsynced"| wal
+  db -->|"every write · in-memory"| art
+  db -->|"Get/Scan · check first"| art
+  db -->|"Get/Scan · memtable miss\n(newest → oldest)"| sr
+  wal --> os
+  sw --> os
+
+  classDef future fill:#cdbb98,stroke:#8c7651,color:#6f624a,stroke-dasharray:5 4;
+  class tcp future
+
+  style L1 fill:#e7ddc9,stroke:#b7a47e,color:#2b2722
+  style L2 fill:#d4c2a1,stroke:#a48f66,color:#2b2722
+  style L3 fill:#bda985,stroke:#8c7651,color:#2b2722
+  style wpath fill:#c9b590,stroke:#8c7651,color:#2b2722
+  style sstfiles fill:#c9b590,stroke:#8c7651,color:#2b2722
+  style os fill:#574c3c,stroke:#3a3225,color:#f4efe6
 ```
 
 ### SSTable on-disk format
@@ -202,20 +230,25 @@ provably has no older live value to mask, so it is safe to drop it entirely.
 
 ### Recovery
 
-On `Open`, Kora reads the MANIFEST to find the live segment list, replays
-them oldest → newest to rebuild the ART memtable, then deletes any SSTable
-files left from the previous session (SSTables are session-local until M4
-adds a WAL checkpoint that makes them durable across restarts).
+On `Open`, Kora reads the MANIFEST to load any durable SSTables from the
+previous session, then replays only the post-checkpoint WAL segments to
+rebuild the ART memtable. The WAL is short — at most one segment since the
+last flush — so recovery is fast regardless of total data size. Orphaned
+files (written but not committed to the MANIFEST before a crash) are
+detected and cleaned up automatically.
 
 ---
 
-## Packages
+## Components
 
-| Package | Role |
-|---|---|
-| `internal/record` | Record encoder/decoder with CRC validation |
-| `internal/art` | Adaptive Radix Tree — sorted memtable (Node4/16/48/256) |
-| `internal/bloom` | Bloom filter (Kirsch-Mitzenmacher double-hashing) |
-| `internal/sstable` | SSTable writer and reader (sparse index + Bloom filter) |
-| `internal/store` | DB: WAL segments, memtable, flush, compaction, scan |
-| `cmd/kora` | Interactive REPL |
+| Component | Package | What it does |
+|---|---|---|
+| REPL | `cmd/kora` | Interactive CLI; one command per line: `set`, `get`, `del`, `scan`, `compact`, `compact-sst`, `stats` |
+| DB | `internal/store` | Coordinates the write path (WAL + memtable), read path (memtable → SSTables), flush, compaction, and crash recovery |
+| WAL segments | `internal/store` | Append-only CRC-framed log files; every acknowledged write is fsynced before returning; replayed at startup to rebuild the memtable |
+| MANIFEST | `internal/store` | Atomic (write-temp → fsync → rename) file recording the live WAL segment list and durable SSTable IDs — the crash-safe commit point for flush and compaction |
+| ART memtable | `internal/art` | Adaptive Radix Tree sorted memtable; O(key-length) lookup; in-order iterator for flush and range scans; Node4 / Node16 / Node48 / Node256 |
+| SSTable writer | `internal/sstable` | Writes flushed memtables as immutable sorted files: `[data][bloom][sparse index][28-byte footer]` |
+| SSTable reader | `internal/sstable` | Serves point lookups (Bloom filter → sparse index → linear scan) and range iterators; loaded from MANIFEST on startup |
+| Bloom filter | `internal/bloom` | Per-SSTable probabilistic filter (Kirsch-Mitzenmacher double-hashing, k=7, ~0.8% FPR); skips files on `Get` when the key is definitely absent |
+| Record encoder | `internal/record` | Encodes/decodes `crc32 \| timestamp \| key_len \| val_len \| key \| value`; detects corruption; tombstones use `val_len = 0xFFFFFFFF` |

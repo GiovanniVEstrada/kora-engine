@@ -4,14 +4,17 @@
 // M3c:   LSM model — writes land in an in-memory ART memtable first; when the
 //        memtable exceeds MaxMemBytes it is flushed to an immutable SSTable on
 //        disk and cleared. Reads check the memtable first, then SSTables newest
-//        → oldest. Segments are still written on every Set/Delete and replayed
-//        on Open to rebuild the memtable; they act as the durability log until
-//        a proper WAL is introduced in M4.
+//        → oldest.
+// M4:    WAL checkpoint — after flushing the memtable to an SSTable, all prior
+//        WAL segments are checkpointed (deleted) and the SSTable is recorded in
+//        the MANIFEST. On restart, SSTables are loaded from the MANIFEST and
+//        only the post-checkpoint WAL is replayed.
 package store
 
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"sync"
 
@@ -91,10 +94,6 @@ func Open(dir string, opts Options) (*DB, error) {
 		ssNextID: 1,
 	}
 
-	// Clean up SSTable files from a previous session — they are ephemeral in
-	// M3c because we always rebuild the memtable from the durable segment log.
-	db.cleanupSSTDir()
-
 	if err := db.load(); err != nil {
 		db.closeAll()
 		return nil, err
@@ -114,11 +113,31 @@ func (db *DB) load() error {
 	if len(m.order) == 0 {
 		return errManifestCorrupt
 	}
+
+	// Load durable SSTables recorded in the manifest (M4).
+	db.ssNextID = m.nextSSTID
+	if db.ssNextID == 0 {
+		db.ssNextID = 1
+	}
+	if err := db.openSSTables(m.sstIDs); err != nil {
+		return err
+	}
+	db.cleanupOrphanedSSTs(m.sstIDs)
+
 	if err := db.openAndScan(m.order); err != nil {
 		return err
 	}
 	db.nextID = m.nextID
 	db.cleanupLeakedSegments()
+
+	// After loading SSTables + replaying WAL, the incremental liveKeys counter
+	// in openAndScan only covers keys seen in the WAL. When the WAL was
+	// checkpointed (M4), the new WAL segment is empty and all key data is in
+	// SSTables, so we must recount from the merged view.
+	if len(db.ssReaders) > 0 {
+		db.liveKeys = len(db.collectScan(nil, nil))
+	}
+
 	return nil
 }
 
@@ -212,7 +231,25 @@ func (db *DB) openAndScan(order []uint32) error {
 }
 
 func (db *DB) writeManifestLocked() error {
-	return writeManifest(db.dir, manifest{nextID: db.nextID, order: db.order})
+	return writeManifest(db.dir, manifest{
+		nextID:    db.nextID,
+		order:     db.order,
+		nextSSTID: db.ssNextID,
+		sstIDs:    db.currentSSTIDs(),
+	})
+}
+
+// currentSSTIDs returns the SSTable IDs in oldest→newest order (opposite of
+// ssReaders which is newest-first).
+func (db *DB) currentSSTIDs() []uint32 {
+	if len(db.ssReaders) == 0 {
+		return nil
+	}
+	ids := make([]uint32, len(db.ssReaders))
+	for i, r := range db.ssReaders {
+		ids[len(db.ssReaders)-1-i] = r.ID()
+	}
+	return ids
 }
 
 func (db *DB) cleanupLeakedSegments() {
@@ -231,15 +268,48 @@ func (db *DB) cleanupLeakedSegments() {
 	}
 }
 
-// cleanupSSTDir removes all *.sst files written by a previous session.
-func (db *DB) cleanupSSTDir() {
+// openSSTables opens the SSTable files listed in sstIDs (oldest→newest) and
+// builds ssReaders newest-first. Called at startup after reading the MANIFEST.
+func (db *DB) openSSTables(sstIDs []uint32) error {
+	if len(sstIDs) == 0 {
+		return nil
+	}
+	readers := make([]*sstable.Reader, 0, len(sstIDs))
+	for i := len(sstIDs) - 1; i >= 0; i-- { // newest first
+		r, err := sstable.Open(db.sstFilePath(sstIDs[i]))
+		if err != nil {
+			for _, r2 := range readers {
+				r2.Close()
+			}
+			return err
+		}
+		readers = append(readers, r)
+	}
+	db.ssReaders = readers
+	return nil
+}
+
+// cleanupOrphanedSSTs removes SSTable files in the sst/ directory whose IDs
+// are not listed in the MANIFEST. These are files written by a flush that
+// crashed before the MANIFEST could be updated.
+func (db *DB) cleanupOrphanedSSTs(live []uint32) {
+	liveSet := make(map[uint32]bool, len(live))
+	for _, id := range live {
+		liveSet[id] = true
+	}
 	entries, err := os.ReadDir(db.sstDir())
 	if err != nil {
-		return // directory doesn't exist yet — fine
+		return
 	}
 	for _, e := range entries {
-		if !e.IsDir() {
-			os.Remove(db.sstFilePath(0)) // path is only used for the dir prefix
+		if e.IsDir() {
+			continue
+		}
+		var id uint32
+		if _, err := fmt.Sscanf(e.Name(), "%06d.sst", &id); err != nil {
+			continue
+		}
+		if !liveSet[id] {
 			os.Remove(db.sstDir() + "/" + e.Name())
 		}
 	}

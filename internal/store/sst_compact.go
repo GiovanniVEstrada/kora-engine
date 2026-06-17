@@ -41,6 +41,21 @@ func (db *DB) CompactSSTables() error {
 		return err
 	}
 
+	// Commit the MANIFEST before swapping in-memory state. If we crash here
+	// the new SSTable is on disk and in the MANIFEST; old files are orphaned
+	// but will be cleaned up on the next Open.
+	newManifest := manifest{
+		nextID:    db.nextID,
+		order:     db.order,
+		nextSSTID: db.ssNextID,
+		sstIDs:    []uint32{newID},
+	}
+	if err := writeManifest(db.dir, newManifest); err != nil {
+		newReader.Close()
+		os.Remove(newPath)
+		return err
+	}
+
 	// Swap: close old readers, install new one.
 	old := db.ssReaders
 	db.ssReaders = []*sstable.Reader{newReader}
