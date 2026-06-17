@@ -82,41 +82,60 @@ SSTable. Reads check the memtable first, then SSTables newest-to-oldest.
 %%{init: {'theme':'base','themeVariables':{'fontFamily':'ui-monospace, Menlo, monospace','lineColor':'#7d7264','primaryTextColor':'#2b2722','fontSize':'13px'}}}%%
 flowchart TB
   client(["CLI / application"])
-
-  subgraph L1["interface"]
-    repl["REPL · cmd/kora\nset  get  del  scan  compact  stats"]
-  end
-
-  subgraph L2["engine · internal/store"]
-    db["DB\nSet · Get · Delete · Scan · Compact"]
-    manifest["MANIFEST\ncrash-safe commit point\nlive WAL segments + durable SSTable IDs"]
-    db <-->|"atomic swap\n(write-temp → fsync → rename)"| manifest
-  end
-
-  subgraph L3["storage · internal/*"]
-    subgraph wpath["write path"]
-      wal["WAL segment\nCRC-framed · fsync'd\ninternal/record"]
-      art["ART memtable\nO(key-len) · sorted · Node4/16/48/256\ninternal/art"]
-    end
-    subgraph sstfiles["SSTables · internal/sstable"]
-      sw["writer · flush when memSize ≥ threshold\ndata · bloom · sparse index · footer"]
-      sr["reader\nbloom filter → sparse index → data scan"]
-    end
-    art -->|"memSize ≥ MaxMemBytes"| sw
-    sw -.->|"open after write"| sr
-  end
-
   tcp(["TCP server · M5 · planned"])
+
+  subgraph L1["interface  ·  cmd/kora"]
+    repl["REPL\nset  get  del  scan  compact  stats"]
+  end
+
+  subgraph L2["engine  ·  internal/store"]
+    db["DB\nSet · Get · Delete · Scan\nCompact · CompactSSTables · Open"]
+    manifest["MANIFEST\ncrash-safe commit point\nlive WAL segment IDs + durable SSTable IDs"]
+  end
+
+  subgraph L3["storage  ·  internal/*"]
+    subgraph wal_sub["WAL segment  ·  internal/record"]
+      wal["CRC-framed append-only log\nfsync'd before write returns"]
+    end
+    subgraph art_sub["memtable  ·  internal/art"]
+      art["ART: key → value | tombstone{}\nO(key-len) · sorted · snapshot iterator"]
+    end
+    subgraph sst_sub["SSTable  ·  internal/sstable"]
+      sstw["Writer\ndata · bloom · sparse index · 28-byte footer"]
+      sstr["Reader  (newest → oldest)\nBloom filter → sparse index → linear scan"]
+      sstw -.->|"open after flush"| sstr
+    end
+  end
+
   os[("OS · file storage")]
 
+  %% client access
   client --> repl --> db
   tcp -.-> db
-  db -->|"every write · fsynced"| wal
-  db -->|"every write · in-memory"| art
-  db -->|"Get/Scan · check first"| art
-  db -->|"Get/Scan · memtable miss\n(newest → oldest)"| sr
+
+  %% write path — WAL must be durable before memtable is mutated
+  db -->|"Set  ①  append + fsync\n(durable before returning)"| wal
+  db -->|"Set  ②  in-memory insert  (now visible to readers)\nDelete: insert tombstone{}  — never erases;\nhides older values in memtable and SSTables"| art
+
+  %% flush commit lifecycle
+  art -->|"memSize ≥ MaxMemBytes\n①  freeze memtable\n②  write + fsync SSTable\n③  MANIFEST atomic swap\n④  install new Reader\n⑤  retire old WAL segments"| sstw
+  db <-->|"atomic swap\n(write-temp → fsync → rename)"| manifest
+
+  %% read path
+  db -->|"Get/Scan  ①  check memtable first\ntombstone{} = not found, stop"| art
+  db -->|"Get/Scan  ②  on miss: walk SSTables newest→oldest\ntombstone in any layer stops the search"| sstr
+
+  %% compaction
+  db -->|"Compact: k-way merge newest→oldest\ndrop shadowed records + safe tombstones\n→ new SSTable → MANIFEST swap → delete old"| sstw
+
+  %% recovery / Open (dashed = startup only, not runtime)
+  manifest -.->|"Open: load durable SSTable IDs\n→ open Readers"| sstr
+  manifest -.->|"Open: load live WAL segment IDs\n→ replay oldest→newest"| wal
+  wal -.->|"Open: rebuild memtable"| art
+
+  %% disk
   wal --> os
-  sw --> os
+  sstw --> os
 
   classDef future fill:#cdbb98,stroke:#8c7651,color:#6f624a,stroke-dasharray:5 4;
   class tcp future
@@ -124,8 +143,9 @@ flowchart TB
   style L1 fill:#e7ddc9,stroke:#b7a47e,color:#2b2722
   style L2 fill:#d4c2a1,stroke:#a48f66,color:#2b2722
   style L3 fill:#bda985,stroke:#8c7651,color:#2b2722
-  style wpath fill:#c9b590,stroke:#8c7651,color:#2b2722
-  style sstfiles fill:#c9b590,stroke:#8c7651,color:#2b2722
+  style wal_sub fill:#c9b590,stroke:#8c7651,color:#2b2722
+  style art_sub fill:#c9b590,stroke:#8c7651,color:#2b2722
+  style sst_sub fill:#c9b590,stroke:#8c7651,color:#2b2722
   style os fill:#574c3c,stroke:#3a3225,color:#f4efe6
 ```
 
