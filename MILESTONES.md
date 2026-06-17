@@ -252,10 +252,10 @@ is present.
 Concepts: client-server architecture, protocol/parser design, connection and
 concurrency handling.
 
-- [ ] A TCP server speaking a simple line or binary protocol (or a small REST
-  layer), supporting `GET` / `SET` / `DEL` / `SCAN`.
-- [ ] Handle multiple concurrent clients.
-- [ ] A thin client library to talk to it.
+- [x] A TCP server speaking RESP2 (Redis wire protocol); `redis-cli` and any
+  Redis client library work out of the box.
+- [x] Handle multiple concurrent clients (one goroutine per connection).
+- [x] A thin Go client library (`client/`) with typed methods for all commands.
 
 **Done when:** you can connect over the network and run commands against your
 engine from a separate process.

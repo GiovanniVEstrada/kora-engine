@@ -11,23 +11,16 @@ LSM-tree with crash recovery and a network server.
 - [x] M2 — Multiple segments + compaction
 - [x] M3 — LSM-tree (ART memtable · SSTables · Bloom filters · range scans)
 - [x] M4 — WAL checkpoint & crash recovery
-- [ ] M5 — TCP server
+- [x] M5 — TCP server (RESP2 · redis-cli compatible)
 
-> **Heads-up — active development.** The items below are known gaps that the
-> next milestones will address. Anything marked M5 may change APIs or on-disk
-> formats before it ships.
+> **Heads-up — active development.** Known gaps that future milestones will address:
 >
-> - **No network access yet.** The only interface is the local REPL (`go run
->   ./cmd/kora`). A TCP server speaking the Postgres wire protocol is planned
->   for M5.
-> - **Single-process only.** No client library, no remote connections. All
->   reads and writes go through the Go API or the REPL in the same process.
 > - **No transactions or MVCC.** Every write is immediately visible to all
->   readers. Snapshot isolation and multi-statement transactions are post-M5
->   stretch goals.
+>   readers. Snapshot isolation and multi-statement transactions are stretch goals.
 > - **Segment WAL is legacy.** The M1/M2 Bitcask-style segment log is still
 >   present alongside the LSM write path. A future cleanup will retire it once
 >   the LSM WAL fully supersedes it.
+> - **Single-node only.** No replication or distributed consensus yet.
 
 See [MILESTONES.md](MILESTONES.md) for the full roadmap and
 [DESIGN.md](DESIGN.md) for tradeoff notes.
@@ -38,7 +31,37 @@ See [MILESTONES.md](MILESTONES.md) for the full roadmap and
 go test ./...        # run the full suite
 ```
 
-Try the REPL:
+### TCP server
+
+```bash
+go run ./cmd/kora-server -dir ./data -addr :6380
+```
+
+Then connect with `redis-cli` or any Redis client library:
+
+```bash
+redis-cli -p 6380 SET hello world
+redis-cli -p 6380 GET hello
+redis-cli -p 6380 SCAN a z        # range scan — returns key/value pairs
+redis-cli -p 6380 DBSIZE
+```
+
+Or with `telnet` / `nc` (inline commands work too):
+
+```
+$ nc localhost 6380
+PING
++PONG
+SET name kora
++OK
+GET name
+$4
+kora
+```
+
+### REPL
+
+Try the local REPL:
 
 ```bash
 go run ./cmd/kora -dir ./data
@@ -56,7 +79,7 @@ OK
 ```
 
 Pass `-no-sync` for faster, less durable writes. Kill the process and
-re-run it against the same `-dir` — your data survives. Use `compact` to
+re-run it against the same `-dir`, your data survives. Use `compact` to
 merge segments, `compact-sst` to merge SSTables, and `stats` to watch
 disk usage drop:
 
@@ -82,7 +105,7 @@ SSTable. Reads check the memtable first, then SSTables newest-to-oldest.
 %%{init: {'theme':'base','themeVariables':{'fontFamily':'ui-monospace, Menlo, monospace','lineColor':'#7d7264','primaryTextColor':'#2b2722','fontSize':'13px'}}}%%
 flowchart TB
   client(["CLI / application"])
-  tcp(["TCP server · M5 · planned"])
+  tcp(["TCP server · RESP2\ncmd/kora-server"])
 
   subgraph L1["interface  ·  cmd/kora"]
     repl["REPL\nset  get  del  scan  compact  stats"]
@@ -137,8 +160,6 @@ flowchart TB
   wal --> os
   sstw --> os
 
-  classDef future fill:#cdbb98,stroke:#8c7651,color:#6f624a,stroke-dasharray:5 4;
-  class tcp future
 
   style L1 fill:#e7ddc9,stroke:#b7a47e,color:#2b2722
   style L2 fill:#d4c2a1,stroke:#a48f66,color:#2b2722
@@ -183,7 +204,7 @@ db.Set([]byte("name"), []byte("kora"))
 1. **Encode & WAL** — the key+value is serialized into a CRC-checked record
    (`crc32 | timestamp | key_len | val_len | key | value`) and appended to the
    active segment file. If `SyncOnWrite` is true, an `fsync` follows before the
-   call returns — the write is on stable storage.
+   call returns and the write is on stable storage.
 
 2. **Memtable update** — the key is inserted into the in-memory **Adaptive
    Radix Tree** (ART) with the raw value. The ART keeps all keys sorted at all
@@ -208,7 +229,7 @@ db.Get([]byte("name"))
 ```
 
 1. **Memtable** — the ART is checked first (O(k), k = key length). A live
-   value returns immediately. A `tombstone{}` value also returns immediately —
+   value returns immediately. A `tombstone{}` value also returns immediately
    as "not found" — without touching disk.
 
 2. **SSTables, newest → oldest** — for each SSTable reader:
@@ -253,7 +274,7 @@ provably has no older live value to mask, so it is safe to drop it entirely.
 On `Open`, Kora reads the MANIFEST to load any durable SSTables from the
 previous session, then replays only the post-checkpoint WAL segments to
 rebuild the ART memtable. The WAL is short — at most one segment since the
-last flush — so recovery is fast regardless of total data size. Orphaned
+last flush so recovery is fast regardless of total data size. Orphaned
 files (written but not committed to the MANIFEST before a crash) are
 detected and cleaned up automatically.
 
@@ -272,3 +293,7 @@ detected and cleaned up automatically.
 | SSTable reader | `internal/sstable` | Serves point lookups (Bloom filter → sparse index → linear scan) and range iterators; loaded from MANIFEST on startup |
 | Bloom filter | `internal/bloom` | Per-SSTable probabilistic filter (Kirsch-Mitzenmacher double-hashing, k=7, ~0.8% FPR); skips files on `Get` when the key is definitely absent |
 | Record encoder | `internal/record` | Encodes/decodes `crc32 \| timestamp \| key_len \| val_len \| key \| value`; detects corruption; tombstones use `val_len = 0xFFFFFFFF` |
+| TCP server | `internal/server` | Accept loop + RESP2 command dispatcher; one goroutine per connection; supports SET, GET, DEL, DBSIZE, PING, SCAN, COMPACT |
+| RESP2 codec | `internal/proto` | RESP2 (Redis wire protocol) encoder and reader; supports both array-format (redis-cli) and inline-format (telnet/nc) commands |
+| Go client | `client` | Typed Go client (`Dial`, `Set`, `Get`, `Delete`, `Scan`, `DBSize`); mutex-safe for concurrent use over one connection |
+| Server binary | `cmd/kora-server` | Standalone server binary; flags: `-dir`, `-addr`, `-no-sync`; graceful shutdown on SIGTERM/SIGINT |
