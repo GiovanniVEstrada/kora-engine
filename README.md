@@ -17,9 +17,10 @@ LSM-tree with crash recovery and a network server.
 >
 > - **No transactions or MVCC.** Every write is immediately visible to all
 >   readers. Snapshot isolation and multi-statement transactions are stretch goals.
-> - **Segment WAL is legacy.** The M1/M2 Bitcask-style segment log is still
->   present alongside the LSM write path. A future cleanup will retire it once
->   the LSM WAL fully supersedes it.
+> - **Segment log doubles as the LSM WAL.** Kora reuses the M1/M2 segment-log
+>   machinery as the write-ahead log for the LSM path. A future cleanup will
+>   retire the Bitcask-specific behaviors and rename the pieces to match their
+>   current role.
 > - **Single-node only.** No replication or distributed consensus yet.
 
 See [MILESTONES.md](MILESTONES.md) for the full roadmap and
@@ -78,8 +79,10 @@ OK
 (nil)
 ```
 
-Pass `-no-sync` for faster, less durable writes. Kill the process and
-re-run it against the same `-dir`, your data survives. Use `compact` to
+Pass `-no-sync` for faster, less durable writes. With the default sync
+mode every acknowledged write is fsynced before returning — kill the process
+and re-run it against the same `-dir` and those writes are replayed on
+startup. Use `compact` to
 merge segments, `compact-sst` to merge SSTables, and `stats` to watch
 disk usage drop:
 
@@ -96,10 +99,12 @@ keys=5 segments=2 sstables=1 disk=512 bytes
 
 ## Architecture
 
-Kora is a **log-structured merge-tree (LSM-tree)**. Writes go to a
-segment WAL for durability and an in-memory sorted memtable for fast reads.
-When the memtable reaches its size threshold it is flushed as an immutable
-SSTable. Reads check the memtable first, then SSTables newest-to-oldest.
+Kora is a **log-structured merge-tree (LSM-tree)**. Every write is first
+appended and fsynced to the WAL before the memtable is updated — an
+acknowledged write survives a crash and is replayed on `Open`. When the
+memtable reaches its size threshold it is frozen and flushed as an immutable
+SSTable; the WAL is then checkpointed and the old segments are retired. Reads
+check the memtable first, then SSTables newest-to-oldest.
 
 ```mermaid
 %%{init: {'theme':'base','themeVariables':{'fontFamily':'ui-monospace, Menlo, monospace','lineColor':'#7d7264','primaryTextColor':'#2b2722','fontSize':'13px'}}}%%
@@ -256,7 +261,9 @@ in ascending order; for duplicate keys across sources the newest source wins.
 Tombstones suppress older versions and are not emitted. All results are
 collected into a slice while the lock is held, then the lock is released and
 an iterator over the slice is returned — safe to use while writes and
-compaction run concurrently.
+compaction run concurrently. The trade-off: the entire result set is
+materialized in memory before any pair is returned, so scanning a large
+fraction of the dataset will spike memory proportionally.
 
 ### Compaction
 
