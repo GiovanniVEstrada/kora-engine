@@ -6,7 +6,7 @@ import (
 	"math/rand"
 	"testing"
 
-	"github.com/giova/strata-engine/internal/store"
+	"github.com/giova/kora-engine/internal/store"
 )
 
 func openTemp(t *testing.T) (*store.DB, string) {
@@ -202,6 +202,59 @@ func assertAgree(t *testing.T, db *store.DB, oracle map[string]string, keys []st
 		if wantOK && string(got) != want {
 			t.Fatalf("key %q: engine=%q, oracle=%q", k, got, want)
 		}
+	}
+}
+
+// TestMemtableFlushAndMultiSourceRead is the M3c end-to-end test. It forces a
+// memtable flush by using a tiny MaxMemBytes, then verifies:
+//   - Keys written before the flush are readable from the SSTable.
+//   - A delete after the flush inserts a memtable tombstone that correctly
+//     shadows the SSTable value.
+//   - A re-set after the delete is visible from the memtable.
+//   - Len() tracks live keys correctly across flush boundaries.
+func TestMemtableFlushAndMultiSourceRead(t *testing.T) {
+	dir := t.TempDir()
+	// 64 bytes triggers a flush after the first few writes.
+	opts := store.Options{SyncOnWrite: false, MaxMemBytes: 64}
+	db, err := store.Open(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// Write enough to trigger at least one flush.
+	for i := 0; i < 10; i++ {
+		mustSet(t, db, fmt.Sprintf("key%d", i), fmt.Sprintf("val%d", i))
+	}
+
+	// All keys must be readable (some from memtable, some from SSTable).
+	for i := 0; i < 10; i++ {
+		got, ok, err := db.Get([]byte(fmt.Sprintf("key%d", i)))
+		if err != nil {
+			t.Fatalf("Get key%d: %v", i, err)
+		}
+		if !ok || string(got) != fmt.Sprintf("val%d", i) {
+			t.Fatalf("key%d: got %q ok=%v", i, got, ok)
+		}
+	}
+
+	// Delete a key that was flushed to SSTable — memtable tombstone must win.
+	mustDelete(t, db, "key0")
+	_, ok, err := db.Get([]byte("key0"))
+	if err != nil || ok {
+		t.Fatalf("key0 after delete: ok=%v err=%v", ok, err)
+	}
+
+	// Re-set the deleted key — memtable value must win over both tombstone and SSTable.
+	mustSet(t, db, "key0", "restored")
+	got, ok, err := db.Get([]byte("key0"))
+	if err != nil || !ok || string(got) != "restored" {
+		t.Fatalf("key0 after restore: got %q ok=%v err=%v", got, ok, err)
+	}
+
+	// Len() must return 10 (all original keys live, key0 restored).
+	if n := db.Len(); n != 10 {
+		t.Fatalf("Len() = %d, want 10", n)
 	}
 }
 

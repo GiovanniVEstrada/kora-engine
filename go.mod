@@ -1,3 +1,3 @@
-module github.com/giova/strata-engine
+module github.com/giova/kora-engine
 
 go 1.26.4

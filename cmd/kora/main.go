@@ -1,17 +1,19 @@
-// Command strata is a small REPL for exercising the StrataDB engine.
+// Command kora is a small REPL for exercising the Kora engine.
 //
 // Usage:
 //
-//	strata [-dir ./data] [-no-sync]
+//	kora [-dir ./data] [-no-sync]
 //
 // Commands (one per line):
 //
 //	set <key> <value...>   store value (value may contain spaces)
 //	get <key>              print value or (nil)
 //	del <key>              delete key
+//	scan <start> [end]     print all live keys in [start, end]; omit end for open-ended
 //	keys                   print number of live keys
 //	compact                merge immutable segments, reclaiming space
-//	stats                  print live keys, segment count, disk usage
+//	compact-sst            merge all SSTables into one (drops tombstones)
+//	stats                  print live keys, segment count, SSTable count, disk usage
 //	help                   list commands
 //	exit | quit            close and exit
 package main
@@ -23,7 +25,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/giova/strata-engine/internal/store"
+	"github.com/giova/kora-engine/internal/store"
 )
 
 func main() {
@@ -39,7 +41,7 @@ func main() {
 	}
 	defer db.Close()
 
-	fmt.Printf("StrataDB REPL — dir=%s sync=%v. Type 'help' for commands.\n", *dir, !*noSync)
+	fmt.Printf("Kora REPL — dir=%s sync=%v. Type 'help' for commands.\n", *dir, !*noSync)
 
 	sc := bufio.NewScanner(os.Stdin)
 	fmt.Print("> ")
@@ -104,6 +106,28 @@ func dispatch(db *store.DB, line string) bool {
 	case "keys":
 		fmt.Println(db.Len())
 
+	case "scan":
+		if len(parts) < 2 {
+			fmt.Println("usage: scan <start> [end]")
+			return false
+		}
+		start := []byte(parts[1])
+		var end []byte
+		if len(parts) >= 3 {
+			end = []byte(parts[2])
+		}
+		next := db.Scan(start, end)
+		count := 0
+		for {
+			k, v, ok := next()
+			if !ok {
+				break
+			}
+			fmt.Printf("%q -> %q\n", k, v)
+			count++
+		}
+		fmt.Printf("(%d keys)\n", count)
+
 	case "compact":
 		if err := db.Compact(); err != nil {
 			fmt.Println("ERR", err)
@@ -111,12 +135,19 @@ func dispatch(db *store.DB, line string) bool {
 		}
 		fmt.Println("OK")
 
+	case "compact-sst":
+		if err := db.CompactSSTables(); err != nil {
+			fmt.Println("ERR", err)
+			return false
+		}
+		fmt.Printf("OK (sstables=%d)\n", db.SSTableCount())
+
 	case "stats":
-		fmt.Printf("keys=%d segments=%d disk=%d bytes\n",
-			db.Len(), db.SegmentCount(), db.DiskUsage())
+		fmt.Printf("keys=%d segments=%d sstables=%d disk=%d bytes\n",
+			db.Len(), db.SegmentCount(), db.SSTableCount(), db.DiskUsage())
 
 	case "help":
-		fmt.Println("commands: set <k> <v> | get <k> | del <k> | keys | compact | stats | help | exit")
+		fmt.Println("commands: set <k> <v> | get <k> | del <k> | scan <start> [end] | keys | compact | compact-sst | stats | help | exit")
 
 	case "exit", "quit":
 		return true

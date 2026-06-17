@@ -7,7 +7,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/giova/strata-engine/internal/store"
+	"github.com/giova/kora-engine/internal/store"
 )
 
 // smallSegOpts forces frequent rollover so tests exercise multiple segments

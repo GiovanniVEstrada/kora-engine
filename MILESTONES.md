@@ -1,4 +1,4 @@
-# StrataDB — Build Roadmap
+# Kora — Build Roadmap
 
 A from-scratch database storage engine, built in milestones. You start with a
 log-structured key-value store (the Bitcask model), grow it into a full
@@ -128,33 +128,96 @@ The hash-index design has two hard limits: the index must fit in RAM, and there
 are no range queries (keys aren't ordered on disk). The log-structured merge-tree
 fixes both. This is what LevelDB, RocksDB, and Cassandra are built on.
 
-Concepts: sorted in-memory structures (skip lists), immutable sorted files
-(SSTables), sparse indexing, k-way merge of sorted runs, Bloom filters, leveled
-vs size-tiered compaction, and the read/write-amplification tradeoffs that define
+Concepts: sorted in-memory structures (ART), immutable sorted files (SSTables),
+sparse indexing, k-way merge of sorted runs, Bloom filters, leveled vs
+size-tiered compaction, and the read/write-amplification tradeoffs that define
 storage-engine design.
 
-- [ ] **M3a — Sorted memtable.** Replace the hashmap with a skip list (or
-  red-black tree). Writes go here first; it stays sorted, so you get range scans
-  over recent data for free.
-- [ ] **M3b — Flush to SSTable.** When the memtable hits a size threshold, freeze
-  it and write it to disk as an immutable Sorted String Table: sorted records in
-  blocks, plus a sparse index (offset of every Nth key) and a footer. You no
-  longer need every key in RAM.
-- [ ] **M3c — Multi-source read path.** A `Get` now checks the active memtable,
-  then any frozen memtable, then SSTables newest → oldest, using each SSTable's
-  sparse index to seek near the key and scan a block.
-- [ ] **M3d — SSTable compaction.** Merge multiple SSTables into fewer, larger
-  ones (start with size-tiered, simpler than leveled). This is a k-way merge of
-  sorted runs — keep newest version per key, drop tombstones.
-- [ ] **M3e — Bloom filters.** Add a Bloom filter per SSTable so a `Get` can skip
-  reading a file that definitely doesn't contain the key. Measure the read-amp
-  improvement.
-- [ ] **Range scans:** expose `Scan(startKey, endKey)` by merging iterators over
-  the memtable and all SSTables.
+### M3a — Sorted memtable (Adaptive Radix Tree)
 
-**Done when:** memory stays bounded regardless of dataset size, reads are served
-from disk via the sparse index, range scans return sorted results, and compaction
-keeps the SSTable count under control.
+Replace the hashmap keydir with an **Adaptive Radix Tree** (`internal/art`).
+
+**Why ART over skip list / red-black tree:** ART lookup is O(k) where k is key
+length, not O(log n) where n is number of keys — faster for large datasets.
+More importantly, its node layout (4 / 16 / 48 / 256 children) is cache-friendly
+in a way that pointer-heavy BSTs and skip lists are not. Keys in this engine are
+`[]byte`, which is exactly the right fit for a trie-based structure.
+
+**Implementation plan — three phases:**
+
+- [x] **Phase 1 — Interface-based nodes.** Build `Node4`, `Node16`, `Node48`,
+  `Node256` as structs implementing a `node` interface. This keeps node-growth
+  transitions (`Node4 → Node16 → ...`) type-safe and easy to test. Interface
+  dispatch overhead is negligible at this stage.
+- [ ] **Phase 2 — Allocation optimization.** Profile under load. If GC pressure
+  from millions of small heap nodes shows up, introduce object pools
+  (`sync.Pool`) or an arena allocator for nodes. `sync.Pool` is the simpler
+  first step; a page-based arena is better long-term for a database.
+- [ ] **Phase 3 — `unsafe.Pointer` hot path** *(only if Phase 2 profiling
+  justifies it).* Replace the interface with a shared header + `kind` byte and
+  manual pointer casts. Keep casts isolated in tiny helper functions; never
+  spread `unsafe` logic across the tree.
+
+**Concurrency model:** single-writer, multi-reader. The writer holds an
+exclusive lock during insert/delete; readers take a shared lock. Concurrent
+writers would require lock-free node replacement (possible but significantly
+harder — defer to after correctness is locked).
+
+**Node48 note:** `Node48` is the trickiest node type. It uses a 256-byte
+key→slot lookup table plus a 48-slot child array, rather than a parallel
+keys[]/children[] layout like Node4/Node16. Treat it as its own mini-milestone.
+
+- [x] **M3a done when:** `internal/art` passes a property-based oracle test
+  (random insert/get/delete against a reference `map[string][]byte`), the
+  iterator yields keys in sorted order, and the store's keydir is an `*art.Tree`.
+
+### M3b — Flush to SSTable
+
+When the memtable hits a size threshold, freeze it and write it to disk as an
+immutable Sorted String Table: sorted records in blocks, plus a sparse index
+(offset of every Nth key) and a footer. You no longer need every key in RAM.
+
+- [x] Define SSTable on-disk format (block layout, sparse index, footer).
+- [x] Implement flush: iterate ART in key order, write sorted blocks.
+- [x] Implement SSTable reader: use sparse index to seek near a key, scan block.
+
+### M3c — Multi-source read path
+
+A `Get` now checks the active memtable, then any frozen memtable, then SSTables
+newest → oldest, using each SSTable's sparse index to seek near the key and scan
+a block.
+
+- [x] Stack memtable + SSTable readers behind a unified `Get`.
+- [x] Frozen memtable: immutable ART snapshot awaiting flush.
+
+### M3d — SSTable compaction
+
+Merge multiple SSTables into fewer, larger ones (size-tiered first, leveled
+later). This is a k-way merge of sorted runs — keep newest version per key,
+drop tombstones.
+
+- [x] k-way merge using a min-heap over SSTable iterators.
+- [x] Atomic swap of old SSTables for merged output (same manifest pattern as M2).
+
+### M3e — Bloom filters
+
+Add a Bloom filter per SSTable so a `Get` can skip reading a file that
+definitely doesn't contain the key. Measure the read-amp improvement.
+
+- [x] One Bloom filter per SSTable, stored in the SSTable footer.
+- [x] `Get` checks filter before seeking into a file.
+
+### Range scans
+
+Expose `Scan(startKey, endKey)` by merging iterators over the memtable and all
+SSTables. ART's in-order iterator makes the memtable side trivial.
+
+- [x] `Scan` API on the store.
+- [x] Merge-iterator over ART + SSTable iterators.
+
+**M3 done when:** memory stays bounded regardless of dataset size, reads are
+served from disk via the sparse index, range scans return sorted results, and
+compaction keeps the SSTable count under control.
 
 ---
 

@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"os"
 
-	"github.com/giova/strata-engine/internal/record"
+	"github.com/giova/kora-engine/internal/record"
 )
 
 // Compact merges all current immutable segments into a single fresh segment,
@@ -66,18 +66,16 @@ func (db *DB) Compact() error {
 		}
 	}
 
-	// 3. Write live (non-tombstone) records to a temp file, recording where each
-	//    lands. Tombstones are dropped: we merged every segment older than the
-	//    active one, so a delete here has no older value left to mask.
+	// 3. Write live (non-tombstone) records to a temp file.
+	//    Tombstones are dropped: we merged every segment older than the active
+	//    one, so a delete here has no older value left to mask.
 	finalPath := segmentPath(db.dir, newID)
 	tmpPath := finalPath + ".compacting"
 	tmp, err := os.OpenFile(tmpPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err
 	}
-	newEntries := make(map[string]entry)
-	var off int64
-	for key, rec := range latest {
+	for _, rec := range latest {
 		if record.IsTombstone(rec) {
 			continue
 		}
@@ -92,8 +90,6 @@ func (db *DB) Compact() error {
 			os.Remove(tmpPath)
 			return err
 		}
-		newEntries[key] = entry{fileID: newID, offset: off, length: buf.Len()}
-		off += int64(buf.Len())
 	}
 	if err := tmp.Sync(); err != nil {
 		tmp.Close()
@@ -141,15 +137,9 @@ func (db *DB) Compact() error {
 		return err
 	}
 
-	// Manifest committed — now it's safe to update in-memory state. Repoint only
-	// keys whose newest record still lives in a snapshot segment; a newer write
-	// to the active segment during the merge must win.
+	// Manifest committed — register the merged segment. The memtable already
+	// holds all live values directly, so no memtable update is needed here.
 	db.segments[newID] = merged
-	for key, ne := range newEntries {
-		if cur, ok := db.keydir[key]; ok && snapSet[cur.fileID] {
-			db.keydir[key] = ne
-		}
-	}
 
 	// Retire the old snapshot segments (best-effort file removal — they're no
 	// longer in the manifest, so a failure only leaks disk).

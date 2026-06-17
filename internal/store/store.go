@@ -1,8 +1,12 @@
-// Package store implements a Bitcask-style append-only key-value store. Writes
-// are appended to an active log segment; when it fills, it is rolled over and a
-// new active segment is opened. An in-memory "keydir" maps each key to the
-// {segment, offset, length} of its newest record, so reads are a single seek.
-// Stale and deleted data is reclaimed by compaction (see compaction.go).
+// Package store implements a log-structured key-value store.
+//
+// M1/M2: Bitcask model — append-only segments, in-memory keydir.
+// M3c:   LSM model — writes land in an in-memory ART memtable first; when the
+//        memtable exceeds MaxMemBytes it is flushed to an immutable SSTable on
+//        disk and cleared. Reads check the memtable first, then SSTables newest
+//        → oldest. Segments are still written on every Set/Delete and replayed
+//        on Open to rebuild the memtable; they act as the durability log until
+//        a proper WAL is introduced in M4.
 package store
 
 import (
@@ -11,58 +15,69 @@ import (
 	"os"
 	"sync"
 
-	"github.com/giova/strata-engine/internal/record"
+	"github.com/giova/kora-engine/internal/art"
+	"github.com/giova/kora-engine/internal/record"
+	"github.com/giova/kora-engine/internal/sstable"
 )
 
 // DefaultMaxSegmentBytes is the active-segment size at which a rollover happens.
 const DefaultMaxSegmentBytes int64 = 4 << 20 // 4 MiB
 
-// entry is a keydir value: which segment holds the newest record for a key, and
-// where in that segment it lives.
-type entry struct {
-	fileID uint32
-	offset int64
-	length int
-}
+// DefaultMaxMemBytes is the memtable size at which a flush to SSTable happens.
+const DefaultMaxMemBytes int64 = 4 << 20 // 4 MiB
+
+// tombstone is stored in the memtable as the value for a deleted key.
+// Using a distinct type (not nil, not []byte{}) lets us distinguish "deleted"
+// from "set to empty string" and ensures a memtable tombstone correctly shadows
+// a live value in an older SSTable during multi-source reads.
+type tombstone struct{}
 
 // Options configures a DB at open time.
 type Options struct {
-	// SyncOnWrite calls fsync after every write before returning. Safe but slow.
-	// See DESIGN.md for the durability/throughput tradeoff.
+	// SyncOnWrite calls fsync after every write before returning.
 	SyncOnWrite bool
-	// MaxSegmentBytes is the active-segment size threshold for rollover. When
-	// <= 0, DefaultMaxSegmentBytes is used.
+	// MaxSegmentBytes is the active-segment size threshold for rollover.
+	// When <= 0, DefaultMaxSegmentBytes is used.
 	MaxSegmentBytes int64
+	// MaxMemBytes is the memtable byte-size threshold that triggers a flush to
+	// SSTable. When <= 0, DefaultMaxMemBytes is used.
+	MaxMemBytes int64
 }
 
-// DefaultOptions favors durability: every write is fsynced before it is
-// acknowledged.
+// DefaultOptions favors durability: every write is fsynced.
 func DefaultOptions() Options {
-	return Options{SyncOnWrite: true, MaxSegmentBytes: DefaultMaxSegmentBytes}
+	return Options{SyncOnWrite: true}
 }
 
-// DB is a segmented append-only key-value store. It is safe for concurrent use:
-// reads take a shared lock (held across the disk read so compaction can swap
-// segments safely), writes take an exclusive lock, and only one compaction runs
-// at a time.
+// DB is a segmented, log-structured key-value store with an in-memory ART
+// memtable. It is safe for concurrent use.
 type DB struct {
 	mu       sync.RWMutex
 	dir      string
 	opts     Options
-	segments map[uint32]*segment // all readable segments, including active
-	active   *segment            // current append target (always order's last)
-	order    []uint32            // segment ids oldest → newest; recency order
-	keydir   map[string]entry
+	segments map[uint32]*segment
+	active   *segment
+	order    []uint32
 	nextID   uint32
 
-	compactMu sync.Mutex // serializes compaction; held outside mu
+	compactMu sync.Mutex
+
+	// M3c memtable layer.
+	memtable  *art.Tree          // key → []byte (live) or tombstone{} (deleted)
+	memSize   int64              // approximate bytes in the memtable
+	liveKeys  int                // exact count of live (non-tombstone) keys
+	ssReaders []*sstable.Reader  // open SSTables, newest first
+	ssNextID  uint32             // next SSTable file id within this session
 }
 
-// Open opens (or creates) a store in dir, rebuilding the in-memory index by
+// Open opens (or creates) a store in dir, rebuilding the in-memory memtable by
 // scanning every segment from oldest to newest.
 func Open(dir string, opts Options) (*DB, error) {
 	if opts.MaxSegmentBytes <= 0 {
 		opts.MaxSegmentBytes = DefaultMaxSegmentBytes
+	}
+	if opts.MaxMemBytes <= 0 {
+		opts.MaxMemBytes = DefaultMaxMemBytes
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
@@ -72,8 +87,13 @@ func Open(dir string, opts Options) (*DB, error) {
 		dir:      dir,
 		opts:     opts,
 		segments: make(map[uint32]*segment),
-		keydir:   make(map[string]entry),
+		memtable: &art.Tree{},
+		ssNextID: 1,
 	}
+
+	// Clean up SSTable files from a previous session — they are ephemeral in
+	// M3c because we always rebuild the memtable from the durable segment log.
+	db.cleanupSSTDir()
 
 	if err := db.load(); err != nil {
 		db.closeAll()
@@ -82,43 +102,32 @@ func Open(dir string, opts Options) (*DB, error) {
 	return db, nil
 }
 
-// load rebuilds in-memory state at startup. The manifest is authoritative: it
-// lists the live segments in recency order. If there is no manifest yet (a
-// fresh store, or one created by pre-manifest code), we bootstrap one.
+// load rebuilds in-memory state at startup via the manifest.
 func (db *DB) load() error {
 	m, err := readManifest(db.dir)
 	switch {
 	case err == errNoManifest:
 		return db.bootstrap()
 	case err != nil:
-		// A corrupt manifest can't be safely reconstructed by scanning the
-		// directory, because compaction no longer keeps id order == recency
-		// order. Surface it rather than guessing.
 		return err
 	}
 	if len(m.order) == 0 {
-		return errManifestCorrupt // a real store always has at least one segment
+		return errManifestCorrupt
 	}
-
 	if err := db.openAndScan(m.order); err != nil {
 		return err
 	}
 	db.nextID = m.nextID
-	// Remove any segment files not named by the manifest — leaked output from a
-	// compaction that crashed before committing its manifest.
 	db.cleanupLeakedSegments()
 	return nil
 }
 
-// bootstrap creates the manifest for a store that doesn't have one: either a
-// fresh directory, or one written by the pre-manifest M2 code (where ascending
-// id order equalled recency, so we can migrate by sorting ids).
+// bootstrap creates the manifest for a store that doesn't have one.
 func (db *DB) bootstrap() error {
 	ids, err := listSegmentIDs(db.dir)
 	if err != nil {
 		return err
 	}
-
 	if len(ids) == 0 {
 		seg, err := createSegment(db.dir, 1)
 		if err != nil {
@@ -130,7 +139,6 @@ func (db *DB) bootstrap() error {
 		db.nextID = 2
 		return db.writeManifestLocked()
 	}
-
 	if err := db.openAndScan(ids); err != nil {
 		return err
 	}
@@ -138,10 +146,8 @@ func (db *DB) bootstrap() error {
 	return db.writeManifestLocked()
 }
 
-// openAndScan opens every segment named in order (oldest → newest), rebuilding
-// the keydir by replaying each in turn. The last id is the active segment. A
-// partial trailing record in the active segment is truncated away; one in an
-// immutable segment is treated as corruption. Caller sets db.nextID.
+// openAndScan opens every segment in order and replays records to rebuild the
+// memtable. Later records win; tombstones remove keys.
 func (db *DB) openAndScan(order []uint32) error {
 	for i, id := range order {
 		isActive := i == len(order)-1
@@ -158,11 +164,26 @@ func (db *DB) openAndScan(order []uint32) error {
 		}
 		db.segments[id] = seg
 
-		end, serr := scanSegment(seg.path, func(rec record.Record, off int64, _ int) error {
+		end, serr := scanSegment(seg.path, func(rec record.Record, _ int64, _ int) error {
 			if record.IsTombstone(rec) {
-				delete(db.keydir, string(rec.Key))
+				raw, wasPresent := db.memtable.Get(rec.Key)
+				if wasPresent {
+					if _, wasTomb := raw.(tombstone); !wasTomb {
+						db.liveKeys--
+					}
+				}
+				db.memtable.Insert(rec.Key, tombstone{})
 			} else {
-				db.keydir[string(rec.Key)] = entry{fileID: id, offset: off, length: record.Size(rec)}
+				raw, wasPresent := db.memtable.Get(rec.Key)
+				if !wasPresent {
+					db.liveKeys++
+				} else if _, wasTomb := raw.(tombstone); wasTomb {
+					db.liveKeys++ // key was deleted, now restored
+				}
+				cp := make([]byte, len(rec.Value))
+				copy(cp, rec.Value)
+				db.memtable.Insert(rec.Key, cp)
+				db.memSize += int64(len(rec.Key) + len(rec.Value))
 			}
 			return nil
 		})
@@ -190,14 +211,10 @@ func (db *DB) openAndScan(order []uint32) error {
 	return nil
 }
 
-// writeManifestLocked persists the current segment set. Caller must hold db.mu
-// (or be in single-threaded startup).
 func (db *DB) writeManifestLocked() error {
 	return writeManifest(db.dir, manifest{nextID: db.nextID, order: db.order})
 }
 
-// cleanupLeakedSegments removes *.data files whose id is not in the live set.
-// Best-effort: failures are ignored (leaked disk, not a correctness problem).
 func (db *DB) cleanupLeakedSegments() {
 	ids, err := listSegmentIDs(db.dir)
 	if err != nil {
@@ -214,8 +231,22 @@ func (db *DB) cleanupLeakedSegments() {
 	}
 }
 
-// Set stores value under key. A nil value is normalized to empty so it is not
-// mistaken for a delete; use Delete to remove a key.
+// cleanupSSTDir removes all *.sst files written by a previous session.
+func (db *DB) cleanupSSTDir() {
+	entries, err := os.ReadDir(db.sstDir())
+	if err != nil {
+		return // directory doesn't exist yet — fine
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			os.Remove(db.sstFilePath(0)) // path is only used for the dir prefix
+			os.Remove(db.sstDir() + "/" + e.Name())
+		}
+	}
+}
+
+// Set stores value under key, writing to the segment log (durability) and
+// updating the memtable. A nil value is normalised to empty.
 func (db *DB) Set(key, value []byte) error {
 	if value == nil {
 		value = []byte{}
@@ -231,15 +262,27 @@ func (db *DB) Set(key, value []byte) error {
 	if err := db.maybeRollover(); err != nil {
 		return err
 	}
-	off := db.active.size
 	if err := db.appendActive(buf.Bytes()); err != nil {
 		return err
 	}
-	db.keydir[string(key)] = entry{fileID: db.active.id, offset: off, length: buf.Len()}
+
+	if !db.isLiveKey(key) {
+		db.liveKeys++
+	}
+	cp := make([]byte, len(value))
+	copy(cp, value)
+	db.memtable.Insert(key, cp)
+	db.memSize += int64(len(key) + len(value))
+
+	if db.memSize >= db.opts.MaxMemBytes {
+		return db.flushMemtable()
+	}
 	return nil
 }
 
-// Delete removes key by appending a tombstone and dropping it from the keydir.
+// Delete removes key by appending a tombstone and marking it deleted in the
+// memtable. A tombstone in the memtable correctly shadows live values in older
+// SSTables during multi-source reads.
 func (db *DB) Delete(key []byte) error {
 	var buf bytes.Buffer
 	if err := record.Encode(&buf, key, nil); err != nil {
@@ -255,33 +298,31 @@ func (db *DB) Delete(key []byte) error {
 	if err := db.appendActive(buf.Bytes()); err != nil {
 		return err
 	}
-	delete(db.keydir, string(key))
+
+	if db.isLiveKey(key) {
+		db.liveKeys--
+	}
+	db.memtable.Insert(key, tombstone{})
+	db.memSize += int64(len(key) + 1)
+
+	if db.memSize >= db.opts.MaxMemBytes {
+		return db.flushMemtable()
+	}
 	return nil
 }
 
 // appendActive writes b to the active segment and fsyncs if configured.
-// Caller must hold db.mu.
 func (db *DB) appendActive(b []byte) error {
 	if err := db.active.append(b); err != nil {
 		return err
 	}
 	if db.opts.SyncOnWrite {
-		if err := db.active.sync(); err != nil {
-			return err
-		}
+		return db.active.sync()
 	}
 	return nil
 }
 
-// maybeRollover opens a new active segment if the current one has reached the
-// size threshold. Caller must hold db.mu.
-//
-// Ordering matters for crash/failure safety: the new segment is created and the
-// manifest is committed *before* db.active is switched. If the manifest write
-// fails we discard the new segment and keep writing to the old active, so we
-// never end up appending to a segment that recovery won't see. The old active
-// is left in db.segments with its existing handle (we simply stop appending to
-// it); reads use ReadAt, which doesn't care that the handle is read-write.
+// maybeRollover opens a new active segment if the current one is at capacity.
 func (db *DB) maybeRollover() error {
 	if db.active.size < db.opts.MaxSegmentBytes {
 		return nil
@@ -290,22 +331,16 @@ func (db *DB) maybeRollover() error {
 	if err := old.sync(); err != nil {
 		return err
 	}
-
 	na, err := createSegment(db.dir, db.nextID)
 	if err != nil {
 		return err
 	}
-
-	// Commit the new segment set before exposing it. On failure, the only state
-	// changed on disk is the (now-orphaned) new segment file, which we remove.
 	newOrder := append(append([]uint32(nil), db.order...), na.id)
 	if err := writeManifest(db.dir, manifest{nextID: db.nextID + 1, order: newOrder}); err != nil {
 		na.close()
 		os.Remove(segmentPath(db.dir, na.id))
 		return err
 	}
-
-	// Manifest committed — the rest is infallible in-memory bookkeeping.
 	db.segments[na.id] = na
 	db.active = na
 	db.order = newOrder
@@ -313,38 +348,74 @@ func (db *DB) maybeRollover() error {
 	return nil
 }
 
-// Get returns the value for key. The second return is false if the key is
-// absent (never set, or deleted). The read lock is held across the disk read so
-// a concurrent compaction cannot close the segment out from under us.
+// Get returns the value for key. It checks the memtable first, then SSTables
+// from newest to oldest. A tombstone in any layer returns (nil, false, nil).
 func (db *DB) Get(key []byte) ([]byte, bool, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 
-	e, ok := db.keydir[string(key)]
-	if !ok {
-		return nil, false, nil
-	}
-	seg := db.segments[e.fileID]
-	if seg == nil {
-		return nil, false, errors.New("store: keydir references missing segment")
+	// Memtable check (in-memory ART — O(key length)).
+	raw, ok := db.memtable.Get(key)
+	if ok {
+		if _, isTomb := raw.(tombstone); isTomb {
+			return nil, false, nil
+		}
+		v := raw.([]byte)
+		cp := make([]byte, len(v))
+		copy(cp, v)
+		return cp, true, nil
 	}
 
-	buf := make([]byte, e.length)
-	if err := seg.readAt(buf, e.offset); err != nil {
-		return nil, false, err
+	// SSTable check, newest first. RawGet distinguishes "absent" from "tombstone"
+	// so a delete in a newer SSTable correctly shadows a value in an older one.
+	for _, sr := range db.ssReaders {
+		val, found, isTomb, err := sr.RawGet(key)
+		if err != nil {
+			return nil, false, err
+		}
+		if isTomb {
+			return nil, false, nil
+		}
+		if found {
+			return val, true, nil
+		}
 	}
-	rec, err := record.Decode(bytes.NewReader(buf))
-	if err != nil {
-		return nil, false, err
-	}
-	return rec.Value, true, nil
+
+	return nil, false, nil
 }
 
-// Len returns the number of live keys currently indexed.
+// isLiveKey reports whether key currently has a live value in the memtable or
+// any SSTable. Caller must hold db.mu.
+func (db *DB) isLiveKey(key []byte) bool {
+	raw, ok := db.memtable.Get(key)
+	if ok {
+		_, isTomb := raw.(tombstone)
+		return !isTomb
+	}
+	for _, sr := range db.ssReaders {
+		_, found, isTomb, _ := sr.RawGet(key)
+		if isTomb {
+			return false
+		}
+		if found {
+			return true
+		}
+	}
+	return false
+}
+
+// Len returns the number of live (non-deleted) keys.
 func (db *DB) Len() int {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
-	return len(db.keydir)
+	return db.liveKeys
+}
+
+// SSTableCount returns the number of SSTable files currently open.
+func (db *DB) SSTableCount() int {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	return len(db.ssReaders)
 }
 
 // SegmentCount returns the number of segment files currently open.
@@ -354,7 +425,7 @@ func (db *DB) SegmentCount() int {
 	return len(db.segments)
 }
 
-// DiskUsage returns the total size in bytes of all segment files.
+// DiskUsage returns the total byte size of all segment files.
 func (db *DB) DiskUsage() int64 {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
@@ -365,14 +436,17 @@ func (db *DB) DiskUsage() int64 {
 	return total
 }
 
-// Close flushes and closes all segment files. The DB must not be used after.
+// Close flushes and closes all segment and SSTable files.
 func (db *DB) Close() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
+	for _, sr := range db.ssReaders {
+		sr.Close()
+	}
+	db.ssReaders = nil
 	return db.closeAll()
 }
 
-// closeAll closes every open segment handle. Caller must hold db.mu.
 func (db *DB) closeAll() error {
 	var firstErr error
 	for _, seg := range db.segments {

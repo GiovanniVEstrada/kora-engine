@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/giova/strata-engine/internal/store"
+	"github.com/giova/kora-engine/internal/store"
 )
 
 // TestManifestCreatedOnOpen confirms a fresh store writes a MANIFEST.

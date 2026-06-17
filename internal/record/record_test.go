@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/giova/strata-engine/internal/record"
+	"github.com/giova/kora-engine/internal/record"
 )
 
 func TestRoundTrip(t *testing.T) {

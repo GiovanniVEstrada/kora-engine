@@ -10,7 +10,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/giova/strata-engine/internal/record"
+	"github.com/giova/kora-engine/internal/record"
 )
 
 // dataExt is the suffix of a segment data file: 000001.data, 000002.data, …

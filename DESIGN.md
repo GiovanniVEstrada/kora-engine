@@ -1,4 +1,4 @@
-# StrataDB — Design Notes
+# Kora — Design Notes
 
 This document records every meaningful tradeoff made during the build. The goal
 is to capture *why*, not just *what* — so future-me and future-readers understand
@@ -171,6 +171,215 @@ with an open handle. Writing merged output to a fresh id (never overwriting an
 open file) and committing via an atomic manifest rename means the swap no longer
 depends on close-before-delete ordering for correctness — old-segment deletion
 is now pure best-effort cleanup.
+
+## Memtable data structure — ART (M3a decision)
+
+The M1/M2 keydir is a plain `map[string]entry` — O(1) average reads/writes but
+unordered, which makes range scans impossible and requires the full key set in
+RAM. M3 replaces it with an **Adaptive Radix Tree** (`internal/art`).
+
+**Why ART over skip list:** Both give O(log n) ordered access in the worst case,
+but ART lookup is O(k) where k is key length — independent of dataset size.
+For large datasets (millions of keys) k grows much slower than log n. The deeper
+reason is cache locality: skip list and BST nodes are heap-allocated and
+pointer-chased; ART's adaptive node sizes (4 / 16 / 48 / 256 children) pack
+keys and child pointers together in a single cache line for small fanouts. Keys
+in this engine are `[]byte`, exactly the right type for a trie-based structure.
+
+**Why ART over red-black tree / AVL tree:** Same cache-line argument, plus ART
+avoids rebalancing entirely — there is no rotation logic to get wrong.
+
+**Implementation strategy — correctness before performance:**
+
+1. *Interface-based nodes first.* `Node4`, `Node16`, `Node48`, `Node256` all
+   implement a `node` interface. Node-growth transitions are type-safe. Interface
+   dispatch adds ~1–2 ns per call — not the bottleneck at correctness stage.
+2. *Allocation optimization second.* Profile under load; if GC pressure from
+   small heap nodes shows up, introduce `sync.Pool` or an arena allocator.
+   An arena is the better long-term choice for a database (deterministic
+   reclamation, no GC scanner overhead).
+3. *`unsafe.Pointer` hot path last* — only if profiling proves interfaces are
+   the bottleneck after allocation is optimized. When used, casts are isolated
+   in tiny helpers; `unsafe` never leaks into tree logic.
+
+**Concurrency model (M3a):** single-writer, multi-reader with a RW mutex. The
+writer holds an exclusive lock during insert/delete; readers share it. Lock-free
+concurrent writes (atomic node replacement) are deferred until after correctness
+is established — they interact badly with path compression and node growth.
+
+**Node48 special case:** unlike Node4/Node16, Node48 does not store a parallel
+`keys[]`/`children[]` array. It uses a 256-byte key→slot index plus a 48-slot
+child array. The indirection is worth it because a 48-entry parallel array would
+require SIMD search to beat the index lookup. Treat Node48 as a distinct
+sub-problem during implementation.
+
+---
+
+## SSTable on-disk format (M3b / M3e)
+
+An SSTable is an immutable file of key-value records written in strictly
+ascending key order. It has four sections:
+
+```
+[data section]
+  record*:  key_len(4) | val_len(4) | key | value
+            val_len == 0xFFFFFFFF is a tombstone (no value bytes follow)
+[bloom section]
+  raw bit array of the per-SSTable Bloom filter
+  (bloom_offset = index_offset - bloom_size; no separate field needed)
+[index section]
+  entry*:   key_len(4) | key | offset(8)
+            one entry per indexStride (16) records; offset is the byte
+            position of that record in the data section
+[footer — last 28 bytes]
+  index_offset(8) | index_count(4) | data_count(4)
+  | bloom_size(4) | bloom_k(4) | magic(4="KORA")
+```
+
+All multi-byte integers are big-endian.
+
+**Why a sparse index instead of a full index:** a full index requires one
+in-memory entry per key, which defeats the purpose of flushing to disk.
+A sparse index (one entry every 16 records) means the reader loads at most
+`ceil(N/16)` entries regardless of dataset size, and scans at most 16 records
+per point lookup. The tradeoff is a linear scan within each block; for the
+current key sizes this is negligible.
+
+**Why tombstones in SSTables:** when a key is deleted it must be represented
+in the SSTable so that compaction can suppress older versions of the same key
+that live in lower-level SSTables. Tombstones are dropped only when a
+compaction covers all SSTables where that key could exist (same rule as M2's
+segment compaction).
+
+**Read path:** `Open` reads the 28-byte footer, loads the Bloom filter and
+index section into memory. `Get(key)` checks the Bloom filter first (returns
+immediately on a definite miss), then binary-searches the index for the last
+entry with key ≤ target, seeks to that offset, and scans forward ≤
+indexStride records. `Iterator` streams the data section from offset 0 to
+`dataEnd` (= `index_offset − bloom_size`).
+
+**Ordering guarantee:** the `Writer` enforces strictly ascending key order,
+returning an error on any out-of-order write. This matches the precondition
+required by the binary-search read path.
+
+---
+
+## Multi-source read path (M3c)
+
+`Get` checks sources in recency order: memtable first, then SSTables newest →
+oldest. A key found anywhere stops the search immediately.
+
+**Tombstone representation in the memtable:** deleted keys are stored as
+`type tombstone struct{}`, a distinct zero-size type. This lets the memtable
+distinguish three states for any key:
+
+- `[]byte` value → live
+- `tombstone{}` → deleted (shadows any value in older SSTables)
+- absent from memtable → not yet written or already flushed
+
+Using `nil` or an empty slice would conflate "deleted" with "set to empty
+value." The distinct type is zero-cost at runtime.
+
+**`RawGet` vs `Get` on the SSTable reader:** `Get` collapses tombstone +
+absent into a single `(nil, false)`. `RawGet` returns a separate `isTombstone`
+flag. The multi-source read path uses `RawGet` so a tombstone in a newer
+SSTable correctly short-circuits the search before reaching an older one that
+might hold the last live value.
+
+**SSTables are session-local in M3:** on `Open`, all SSTable files from prior
+sessions are deleted and the memtable is rebuilt entirely from the segment log.
+This defers cross-restart SSTable persistence to M4's write-ahead log +
+checkpoint design. The `DefaultMaxMemBytes` is 4 MiB so existing tests
+(small datasets) don't accidentally trigger flushes.
+
+---
+
+## SSTable compaction (M3d)
+
+`CompactSSTables` merges all open SSTable readers into a single file via a
+**k-way merge** using a min-heap:
+
+- Each SSTable contributes a `CompactionIterator` (exposes tombstones)
+- Heap ordering: ascending key; for equal keys, ascending `sstIdx` (0 =
+  newest SSTable inserted first — it wins the tie)
+- The first (newest) occurrence of each key is written to the output;
+  subsequent occurrences of the same key are skipped as stale versions
+- **Tombstones are dropped** because the merge covers every SSTable —
+  there is no older source outside the merge that could hold a live value
+  the tombstone would need to suppress. This is the same invariant as M2's
+  segment compaction.
+
+**Atomic swap:** the merged file is written to a fresh SSTable id before the
+in-memory state is touched. Once the merged `Reader` is open, the old readers
+are replaced in one assignment (`db.ssReaders = []*sstable.Reader{newReader}`),
+then old files are closed and deleted best-effort. A crash before the swap
+leaves the old SSTables intact; a crash after leaves an orphaned merged file
+that `cleanupSSTDir` removes on the next `Open`.
+
+---
+
+## Bloom filters (M3e)
+
+Each SSTable carries a Bloom filter to let `RawGet` skip I/O for keys that
+are definitely absent.
+
+**Algorithm:** Kirsch-Mitzenmacher double-hashing. A single 64-bit FNV-1a
+hash is split into two 32-bit halves `(h1, h2)`; the *i*-th probe position
+is `(h1 + i·h2) % m`. This is asymptotically equivalent to *k* independent
+hash functions while requiring only one hash computation per key.
+
+**Parameters:** 10 bits per element, k = 7 hash functions → theoretical
+false-positive rate ≈ 0.81%. These are fixed constants; future work could
+tune per-level.
+
+**m must be byte-aligned:** `bloom.New(n)` rounds `m` up to the nearest byte
+boundary so that `Load(f.Bytes(), f.K())` — which reconstructs `m` as
+`len(bits)*8` — agrees exactly with the original `m`. Without this rounding,
+the probe positions during `Has` would differ from those during `Add` and the
+filter would produce false negatives for its own added keys.
+
+**Tombstones are in the filter:** a deleted key is added to the Bloom filter
+just like a live key. If tombstones were excluded, `RawGet` would short-circuit
+on a "definitely absent" filter hit and fall through to an older SSTable,
+potentially returning a stale live value — a correctness bug, not just a
+performance issue.
+
+**Writer builds the filter at `Close` time** by re-scanning the data section
+(one sequential pass, already in the OS page cache from the write) with the
+exact insertion count. This avoids pre-allocating memory for an unknown number
+of keys and keeps the writer interface unchanged (`NewWriter(path)`).
+
+---
+
+## Range scans (M3 — range scans)
+
+`Scan(start, end []byte)` returns a snapshot iterator over all live keys in
+`[start, end]` in ascending order. Either bound may be `nil` (open-ended).
+
+**Merge-iterator design:** identical to `CompactSSTables`'s k-way heap, but
+instead of writing to a file the results are collected into a slice. Sources:
+
+0. Memtable (ART `Iterator()`) — pre-collects all leaves into a slice on
+   call, making it an instant snapshot safe to use after lock release
+1..n. SSTable `ScanIterator(start, end)` — uses `seekOffset(start)` to jump
+   near the start key via the sparse index, then streams forward
+
+Tombstones suppress older versions of the same key but are not emitted.
+
+**Snapshot-under-lock:** the entire k-way merge runs under `db.mu.RLock`.
+Results are collected eagerly into a `[]scanKV` slice, then the lock is
+released. The returned iterator function walks the slice. This makes the
+iterator safe to use concurrently with writes and `CompactSSTables` — the
+scan sees a consistent point-in-time view of the engine with no risk of
+reading from a closed SSTable file. The memory cost is O(result size), which
+is acceptable for M3; a lazy iterator with ref-counted SSTable handles is
+the natural M4/M5 upgrade.
+
+**Ordering guarantee:** the `Writer` enforces strictly ascending key order,
+returning an error on any out-of-order write. This matches the precondition
+required by the binary-search read path.
+
+---
 
 ## Record size limits (M2 hardening)
 
